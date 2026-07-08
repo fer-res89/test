@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phylotools"
+version = "0.1.0"
+description = "Phylogenomic batch-processing tools: forge (OrthoFinder output filtering/QC) and aeon (MCMCTree/CodeML batch pipeline)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+forge = "forge.cli:main"
+aeon = "aeon.cli:main"
+
+[project.optional-dependencies]
+forge = [
+    "biopython>=1.80",
+    "rich>=13.0",
+]
+aeon = [
+    "dendropy>=4.6",
+    "ete3>=3.1",
+]
+all = [
+    "phylotools[forge]",
+    "phylotools[aeon]",
+]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["forge*", "aeon*", "phylotools_common*"]
