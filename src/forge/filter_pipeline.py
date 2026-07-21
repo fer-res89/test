@@ -535,7 +535,9 @@ def run_filter_pipeline(args: argparse.Namespace) -> None:
         processed_msg_parts.append(f"deduped {n_files} FASTA file(s)")
 
     # Optional clean-labels for FASTA **and** GENE TREES
+    # Optional clean-labels for FASTA **and** GENE TREES
     if args.clean_labels:
+        _phase("Cleaning labels on FASTAs and gene trees...")
         taxon_list, taxon_regex = load_taxon_filter(args.clean_labels)
 
         # FASTA files in output dir
@@ -543,18 +545,37 @@ def run_filter_pipeline(args: argparse.Namespace) -> None:
         fasta_files: List[str] = []
         for pat in fasta_pats:
             fasta_files.extend(glob.glob(pat))
-        for fp in fasta_files:
-            base, ext = os.path.splitext(fp)
-            out = fp if args.inplace else f"{base}_cleaned{ext}"
-            clean_fasta(fp, taxon_list, taxon_regex, args.keep_accession, out)
-
-        # Gene trees in the copied tree dir
         tree_files: List[str] = [str(p) for p in tree_dir.glob("*_tree*.txt") if p.is_file()]
-        for tp in tree_files:
-            base, ext = os.path.splitext(tp)
-            out = tp if args.inplace else f"{base}_cleaned{ext}"
-            clean_newick(tp, taxon_list, taxon_regex, args.keep_accession, out)
 
+        total_clean = len(fasta_files) + len(tree_files)
+        done_clean = 0
+        clean_start = time.time()
+        clean_kind = "FASTAs"
+
+        def _clean_render(spin: str) -> Text:
+            eta_str, rate = _estimate_eta(done_clean, total_clean, clean_start)
+            return Text(
+                f"{spin} Cleaning labels ({clean_kind}) | "
+                f"{done_clean}/{total_clean} | {rate:.1f}/s | ETA {eta_str}"
+            )
+
+        with TickingStatus(_console, _clean_render, interval=0.15):
+            for fp in fasta_files:
+                base, ext = os.path.splitext(fp)
+                out = fp if args.inplace else f"{base}_cleaned{ext}"
+                clean_fasta(fp, taxon_list, taxon_regex, args.keep_accession, out)
+                done_clean += 1
+
+            clean_kind = "gene trees"
+            for tp in tree_files:
+                base, ext = os.path.splitext(tp)
+                out = tp if args.inplace else f"{base}_cleaned{ext}"
+                clean_newick(tp, taxon_list, taxon_regex, args.keep_accession, out)
+                done_clean += 1
+
+        _console.print(
+            f"[filter] Cleaned {len(fasta_files)} FASTA(s) + {len(tree_files)} tree(s)."
+        )
         processed_msg_parts.append(
             f"clean-labels on FASTA + trees{' (in-place)' if args.inplace else ''}"
         )
