@@ -510,16 +510,36 @@ def run_filter_pipeline(args: argparse.Namespace) -> None:
         need_species_tree=need_species_tree,
     )
 
+    # Compute this BEFORE splitting trees: og_ids only depends on
+    # Orthogroups.GeneCount.tsv, not on the trees file, and splitting a big
+    # Resolved_Gene_Trees.txt only makes sense for the orthogroups we're
+    # actually going to keep (copy_gene_trees_for_ids discards everything
+    # else immediately afterward anyway).
+    _phase("Selecting all-taxa orthogroups (reading GeneCount.tsv)...")
+    og_ids = list_all_taxa_orthogroups(og_counts)
+    if not og_ids:
+        raise ValueError(
+            f"No all-taxa orthogroups found in {og_counts} "
+            "(every row has at least one zero/missing-species column). "
+            "Nothing to filter/copy -- check the GeneCount.tsv contents."
+        )
+    _console.print(f"[filter] {len(og_ids)} all-taxa orthogroup(s) selected.")
+
     # Materialize trees into a directory (handles Resolved_Gene_Trees.txt).
-    # This is silent-but-slow when --trees is a single multi-tree file (it
-    # writes one file per orthogroup), so show a live count while it runs.
+    # When --trees is a single multi-tree file, filter to just the all-taxa
+    # og_ids above instead of writing every orthogroup in the file to disk --
+    # for a run where all-taxa OGs are a small fraction of the total, this
+    # avoids writing (and later ignoring) the vast majority of files.
     if Path(trees_path).is_dir():
         _phase(f"Using gene tree directory: {trees_path}")
         trees_dir = materialize_trees_if_needed(
             Path(trees_path), work_dir=work_dir / "trees_split"
         )
     else:
-        _phase(f"Reading & splitting gene trees from {Path(trees_path).name} ...")
+        _phase(
+            f"Reading & splitting gene trees from {Path(trees_path).name} "
+            f"(keeping only the {len(og_ids)} all-taxa orthogroup(s))..."
+        )
         split_written = 0
         split_start = time.time()
 
@@ -540,8 +560,12 @@ def run_filter_pipeline(args: argparse.Namespace) -> None:
                 Path(trees_path),
                 work_dir=work_dir / "trees_split",
                 on_progress=_split_progress,
+                wanted_ids=set(og_ids),
             )
-        _console.print(f"[filter] Split {split_written} gene tree(s).")
+        _console.print(
+            f"[filter] Split {split_written} gene tree(s) "
+            f"(of {len(og_ids)} requested)."
+        )
 
     tree_dir_rel = Path("Gene_Trees/all_taxa_orthogroups")
     tree_dir = base_dir / tree_dir_rel
@@ -555,10 +579,6 @@ def run_filter_pipeline(args: argparse.Namespace) -> None:
 
     tree_dir_was_new = newly_created_dir_was(tree_dir)
     fasta_dir_was_new = newly_created_dir_was(fasta_dir)
-
-    _phase("Selecting all-taxa orthogroups (reading GeneCount.tsv)...")
-    og_ids = list_all_taxa_orthogroups(og_counts)
-    _console.print(f"[filter] {len(og_ids)} all-taxa orthogroup(s) selected.")
 
     # Copy trees from trees_dir (not base_dir/Gene_Trees)
     _phase("Copying gene trees for all-taxa orthogroups...")
