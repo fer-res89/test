@@ -170,16 +170,107 @@ def open_tree_file(tree_file: Path):
 def tip_species(label: str) -> str:
     return (label or "").split("|", 1)[0].strip()
 
+# Sentinels for the single-pass monophyly scan. _MIXED marks a subtree
+# containing more than one species; _UNNAMED is a pseudo-species for tips
+# with no usable label (they behave like a distinct species, so a named
+# species' clade that contains one is not monophyletic).
+_MIXED = object()
+_UNNAMED = object()
+
+
+def nonmonophyletic_species(tree_obj, species_of_interest: Iterable[str]) -> Set[str]:
+    """Return the subset of `species_of_interest` whose tips are NOT
+    rooted-monophyletic in this tree, computed in a SINGLE post-order pass.
+
+    Semantics are identical to calling is_species_multiplicity_monophyletic()
+    once per species (a species with <= 1 tip is always fine; otherwise all
+    its tips must form a rooted clade containing no tip of any other species,
+    including unnamed tips) -- but O(N) per tree instead of
+    O(species x N x targets), since it avoids recomputing get_terminals() and
+    an MRCA path-trace for every species.
+
+    Correctness argument: for a species s with total tip count n_s >= 2, s is
+    rooted-monophyletic iff some node's subtree is "pure s" (contains only
+    s-tips) AND holds all n_s of them. We track, per node, (subtree tip count,
+    pure species | _MIXED), and record the largest pure-s clade size seen;
+    s is monophyletic iff that largest size equals n_s.
+    """
+    interest = set(species_of_interest)
+
+    total_count: Dict[object, int] = {}     # species -> total tips in tree
+    max_pure_count: Dict[object, int] = {}  # species -> largest pure clade size
+
+    count: Dict[int, int] = {}       # id(node) -> tips in subtree
+    pure: Dict[int, object] = {}     # id(node) -> species name / _UNNAMED / _MIXED
+
+    # Explicit iterative post-order (avoids Python recursion limits on very
+    # large trees and BioPython's slower recursive helpers).
+    root = tree_obj.root
+    stack = [(root, False)]
+    while stack:
+        node, processed = stack.pop()
+        children = node.clades
+        if not processed:
+            stack.append((node, True))
+            for ch in children:
+                stack.append((ch, False))
+            continue
+
+        if not children:
+            # terminal
+            sp = tip_species(node.name) if node.name else ""
+            sp_key: object = sp if sp else _UNNAMED
+            count[id(node)] = 1
+            pure[id(node)] = sp_key
+            if sp_key is not _UNNAMED:
+                total_count[sp_key] = total_count.get(sp_key, 0) + 1
+            continue
+
+        c = 0
+        subtree_species: object = None
+        seen_first = False
+        mixed = False
+        for ch in children:
+            c += count.pop(id(ch))
+            ps = pure.pop(id(ch))
+            if mixed:
+                continue
+            if ps is _MIXED:
+                mixed = True
+            elif not seen_first:
+                subtree_species = ps
+                seen_first = True
+            elif ps != subtree_species:
+                # != is value-equality for species-name strings and identity
+                # for the _UNNAMED sentinel (a distinct object), which is
+                # exactly what we want.
+                mixed = True
+
+        count[id(node)] = c
+        if mixed:
+            pure[id(node)] = _MIXED
+        else:
+            pure[id(node)] = subtree_species
+            if subtree_species is not _UNNAMED and subtree_species is not None:
+                if max_pure_count.get(subtree_species, 0) < c:
+                    max_pure_count[subtree_species] = c
+
+    bad: Set[str] = set()
+    for sp in interest:
+        n = total_count.get(sp, 0)
+        if n <= 1:
+            continue
+        if max_pure_count.get(sp, 0) != n:
+            bad.add(sp)
+    return bad
+
+
 def is_species_multiplicity_monophyletic(tree_obj, species: str) -> bool:
-    leaves = [t for t in tree_obj.get_terminals() if t.name]
-    targets = [t for t in leaves if tip_species(t.name) == species]
-
-    if len(targets) <= 1:
-        return True
-
-    mrca = tree_obj.common_ancestor(targets)
-    descendants = list(mrca.get_terminals())
-    return all(d.name and tip_species(d.name) == species for d in descendants)
+    """Backward-compatible single-species check. Prefer
+    nonmonophyletic_species() for QC over many species -- this shim exists
+    for any external callers and simply asks the batch scan about one
+    species."""
+    return species not in nonmonophyletic_species(tree_obj, (species,))
 
 def iter_tree_files(tree_dir: Path):
     for p in tree_dir.iterdir():
@@ -219,8 +310,10 @@ def qc_gene_trees_for_isos(tree_dir: Path, species_list: List[str]) -> Tuple[Lis
             except Exception:
                 bad.append(p.name)
             else:
-                flags = [is_species_multiplicity_monophyletic(t, sp) for sp in species_list]
-                (good if all(flags) else bad).append(p.name)
+                # Single post-order pass over the whole tree, checking every
+                # species at once, instead of one MRCA path-trace per species.
+                violations = nonmonophyletic_species(t, species_list)
+                (good if not violations else bad).append(p.name)
             done += 1
 
     elapsed = time.time() - start_time
@@ -320,6 +413,40 @@ def _pick_default_species_tree(base_dir: Path) -> Path | None:
             return c
     return None
 
+def resolve_fasta_out_dir(
+    value: Optional[str],
+    base_dir: Path,
+    default_parent: str = "Orthogroup_Sequences",
+    default_name: str = "all_taxa_fas",
+) -> Path:
+    """Resolve the --fasta-out value into an output directory.
+
+    One flag, three behaviors:
+      - None (default): base_dir / Orthogroup_Sequences / all_taxa_fas
+      - a BARE NAME with no path separator (e.g. "my_fastas"): treated as a
+        rename of the folder inside the default parent, i.e.
+        base_dir / Orthogroup_Sequences / my_fastas
+      - a PATH with directory components:
+          * relative (e.g. "out/fastas", "../elsewhere"): resolved against
+            base_dir
+          * absolute (e.g. "/data/fastas"): used as-is
+
+    This lets a user either just rename the output folder or relocate it
+    entirely, without a second flag.
+    """
+    if value is None:
+        return base_dir / default_parent / default_name
+
+    p = Path(value)
+    if p.is_absolute():
+        return p
+    if p.parent == Path("."):
+        # bare name -> rename inside the default parent
+        return base_dir / default_parent / p
+    # relative path with directory components -> relative to base_dir
+    return base_dir / p
+
+
 def run_filter_pipeline(args: argparse.Namespace) -> None:
     base_dir: Path = args.base_dir
 
@@ -360,8 +487,13 @@ def run_filter_pipeline(args: argparse.Namespace) -> None:
 
     tree_dir_rel = Path("Gene_Trees/all_taxa_orthogroups")
     tree_dir = base_dir / tree_dir_rel
-    fasta_out_rel = Path("Orthogroup_Sequences/all_taxa_fas")
-    fasta_dir = base_dir / fasta_out_rel
+    fasta_dir = resolve_fasta_out_dir(getattr(args, "fasta_out", None), base_dir)
+    # For the "new directories" report, show a path relative to base_dir when
+    # the output lives under it, otherwise show the resolved path as-is.
+    try:
+        fasta_out_rel = fasta_dir.relative_to(base_dir)
+    except ValueError:
+        fasta_out_rel = fasta_dir
 
     tree_dir_was_new = newly_created_dir_was(tree_dir)
     fasta_dir_was_new = newly_created_dir_was(fasta_dir)
@@ -497,6 +629,14 @@ def register(sub, formatter_class) -> None:
         "--species-tree", type=Path, default=None,
         help=("Species tree file path. Only required when using --dedupe without --taxa-file. "
             "If omitted, defaults are searched under --base-dir.")
+    )
+    sp_filter.add_argument(
+        "--fasta-out", metavar="NAME_OR_PATH", type=str, default=None,
+        help=("Output directory for the copied good-OG FASTAs. Accepts EITHER "
+            "a bare name (e.g. 'my_fastas'), which just renames the folder "
+            "inside the default Orthogroup_Sequences/ parent, OR a path "
+            "(relative to --base-dir, or absolute) to place the output "
+            "anywhere. Default: Orthogroup_Sequences/all_taxa_fas")
     )
     # Optional: where to write split trees if --trees is a multi-tree file
     sp_filter.add_argument(
