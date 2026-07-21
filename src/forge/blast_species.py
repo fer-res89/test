@@ -250,6 +250,55 @@ def run_blast_species(args: argparse.Namespace) -> None:
                 return parts[1]
         return s
 
+    # taxid -> resolved "Genus_species" name (or a placeholder if it can't be
+    # resolved). Keyed by taxid rather than by db or entry_id: a taxid always
+    # means the same species regardless of which DB/entry it came from, and
+    # keying this way means a single-species target DB (the common case for
+    # this tool) needs at most one blastdbcmd call total, no matter how many
+    # hits are appended against it.
+    species_name_cache: Dict[str, str] = {}
+    species_name_cache_lock = threading.Lock()
+
+    def resolve_species_name(hit_db: str, entry_id: str, taxid: str) -> str:
+        with species_name_cache_lock:
+            cached = species_name_cache.get(taxid)
+        if cached is not None:
+            return cached
+
+        name = None
+        try:
+            proc = subprocess.run(
+                ["blastdbcmd", "-db", hit_db, "-entry", entry_id, "-outfmt", "%S"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            out_lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+            if out_lines:
+                name = out_lines[0].strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            name = None
+
+        if not name or name.upper() in ("N/A", "NA"):
+            name = f"taxid{taxid}"
+            log_console(
+                f"Warning: could not resolve a scientific name for taxid {taxid} "
+                f"(db={db_label(hit_db)}, entry={entry_id}); using placeholder "
+                f"'{name}'. Is this BLAST DB missing taxonomy info "
+                f"(taxdb.bti/taxdb.btd, or built without -taxid_map)?"
+            )
+        else:
+            name = re.sub(r"\s+", "_", name)
+            name = re.sub(r"[^A-Za-z0-9_.-]", "", name)
+
+        with species_name_cache_lock:
+            species_name_cache[taxid] = name
+        return name
+
+    def clean_header(entry_id: str, species_name: str) -> str:
+        return f">{entry_id}_{species_name}"
+
     def get_db_kind(db: str) -> str:
         try:
             proc = subprocess.run(
@@ -432,7 +481,7 @@ def run_blast_species(args: argparse.Namespace) -> None:
     for db in db_list:
         db_kind_by_db[db] = get_db_kind(db)
 
-    log_console(f"db_mode={db_mode} n_dbs={len(db_list)} prog={prog} outfmt='{outfmt}'")
+    log_console(f"[DEBUG] db_mode={db_mode} n_dbs={len(db_list)} prog={prog} outfmt='{outfmt}'")
 
     fasta_info: Dict[str, Dict[str, str]] = {}
     fasta_logs: Dict[str, List[str]] = {}
@@ -624,7 +673,8 @@ def run_blast_species(args: argparse.Namespace) -> None:
 
                     start = min(sstart, send)
                     end = max(sstart, send)
-                    header = f">{entry_id}|HSP:{start}-{end}|frame:{sframe}|taxid:{taxid}|bits:{score}"
+                    species_name = resolve_species_name(hit_db, entry_id, taxid)
+                    header = clean_header(entry_id, species_name)
 
                     with open(out_fasta, "a") as out_h:
                         out_h.write(header + "\n")
@@ -633,8 +683,9 @@ def run_blast_species(args: argparse.Namespace) -> None:
 
                     appended += 1
                     local_log_lines.append(
-                        f"Appended RANGE-AA (tblastn HSP) for taxid {taxid}: {entry_id} "
-                        f"from {db_label(hit_db)} (bitscore {score})"
+                        f"Appended RANGE-AA (tblastn HSP) for taxid {taxid} "
+                        f"({species_name}): {entry_id} HSP {start}-{end} "
+                        f"frame {sframe} from {db_label(hit_db)} (bitscore {score})"
                     )
                     continue
 
@@ -657,16 +708,18 @@ def run_blast_species(args: argparse.Namespace) -> None:
                         continue
 
                     lines = proc.stdout.splitlines()
+                    species_name = resolve_species_name(hit_db, entry_id, taxid)
                     if lines and lines[0].startswith(">"):
-                        lines[0] = f"{lines[0]}|HSP:{start}-{end}|strand:{strand}|taxid:{taxid}|bits:{score}"
+                        lines[0] = clean_header(entry_id, species_name)
 
                     with open(out_fasta, "a") as out_h:
                         out_h.write("\n".join(lines) + ("\n" if lines else ""))
 
                     appended += 1
                     local_log_lines.append(
-                        f"Appended RANGE-DNA (blastn HSP) for taxid {taxid}: {entry_id} "
-                        f"from {db_label(hit_db)} (bitscore {score})"
+                        f"Appended RANGE-DNA (blastn HSP) for taxid {taxid} "
+                        f"({species_name}): {entry_id} HSP {start}-{end} "
+                        f"strand {strand} from {db_label(hit_db)} (bitscore {score})"
                     )
                     continue
 
@@ -708,18 +761,18 @@ def run_blast_species(args: argparse.Namespace) -> None:
                                 continue
 
                             lines = proc.stdout.splitlines()
+                            species_name = resolve_species_name(hit_db, entry_id, taxid)
                             if lines and lines[0].startswith(">"):
-                                lines[0] = (
-                                    f"{lines[0]}|HSP:{start}-{end}|strand:{strand}|taxid:{taxid}|bits:{score}"
-                                )
+                                lines[0] = clean_header(entry_id, species_name)
 
                             with open(out_fasta, "a") as out_h:
                                 out_h.write("\n".join(lines) + ("\n" if lines else ""))
 
                             appended += 1
                             local_log_lines.append(
-                                f"Appended RANGE-DNA fallback for taxid {taxid}: {entry_id} "
-                                f"from {db_label(hit_db)} (bitscore {score})"
+                                f"Appended RANGE-DNA fallback for taxid {taxid} "
+                                f"({species_name}): {entry_id} HSP {start}-{end} "
+                                f"strand {strand} from {db_label(hit_db)} (bitscore {score})"
                             )
                             continue
                         else:
@@ -843,7 +896,7 @@ def run_blast_species(args: argparse.Namespace) -> None:
                     max_workers = max(1, int(args.jobs))
 
                 log_console(
-                    f"multi-db mode: scheduling {len(all_jobs)} jobs "
+                    f"[DEBUG] multi-db mode: scheduling {len(all_jobs)} jobs "
                     f"with max_workers={max_workers}, db_threads={multi_db_threads}"
                 )
 
