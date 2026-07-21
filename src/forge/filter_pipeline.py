@@ -40,7 +40,7 @@ from ._progress import TickingStatus
 from .dedupe import run_dedupe_dir_inplace
 from .clean_labels import load_taxon_filter, clean_fasta, clean_newick
 
-_console = Console(stderr=True)
+_console = Console(stderr=True, markup=False)
 
 
 def _fmt_elapsed(seconds: float) -> str:
@@ -58,6 +58,36 @@ def _estimate_eta(done: int, total: int, start_time: float) -> tuple[str, float]
     remaining = max(total - done, 0)
     eta_seconds = remaining / rate if rate > 0 else 0.0
     return _fmt_elapsed(eta_seconds), rate
+
+
+def _phase(msg: str) -> None:
+    """Print a phase banner to stderr. Unlike the transient spinner, this
+    always prints -- even when output is piped to a file / not a TTY -- so
+    every stage has at least one visible marker in a log."""
+    _console.print(f"[filter] {msg}")
+
+
+class _elapsed_spinner:
+    """Context manager: show a spinner with a fixed message + elapsed time
+    for a blocking step whose internal progress we can't easily count. The
+    spinner keeps ticking on a background thread while the wrapped call
+    blocks, so it never looks frozen even for a single long operation."""
+    def __init__(self, label: str):
+        self.label = label
+        self.start = time.time()
+        self._status = None
+
+    def _render(self, spin: str) -> Text:
+        return Text(f"{spin} {self.label} ({_fmt_elapsed(time.time() - self.start)})")
+
+    def __enter__(self):
+        self._status = TickingStatus(_console, self._render, interval=0.15)
+        self._status.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        self._status.__exit__(*exc)
+        return False
 
 def verify_expected_inputs(
     og_counts_tsv: Path,
@@ -471,6 +501,7 @@ def run_filter_pipeline(args: argparse.Namespace) -> None:
         raise FileNotFoundError("Dedupe requires --species-tree when --taxa-file is not provided "
                                 "(or a default species tree under base-dir).")
 
+    _phase("Verifying expected inputs...")
     verify_expected_inputs(
         og_counts_tsv=Path(og_counts),
         trees_path=Path(trees_path),
@@ -479,11 +510,38 @@ def run_filter_pipeline(args: argparse.Namespace) -> None:
         need_species_tree=need_species_tree,
     )
 
-    # Materialize trees into a directory (handles Resolved_Gene_Trees.txt)
-    trees_dir = materialize_trees_if_needed(
-        Path(trees_path),
-        work_dir=work_dir / "trees_split"
-    )
+    # Materialize trees into a directory (handles Resolved_Gene_Trees.txt).
+    # This is silent-but-slow when --trees is a single multi-tree file (it
+    # writes one file per orthogroup), so show a live count while it runs.
+    if Path(trees_path).is_dir():
+        _phase(f"Using gene tree directory: {trees_path}")
+        trees_dir = materialize_trees_if_needed(
+            Path(trees_path), work_dir=work_dir / "trees_split"
+        )
+    else:
+        _phase(f"Reading & splitting gene trees from {Path(trees_path).name} ...")
+        split_written = 0
+        split_start = time.time()
+
+        def _split_progress(n: int) -> None:
+            nonlocal split_written
+            split_written = n
+
+        def _split_render(spin: str) -> Text:
+            elapsed = time.time() - split_start
+            rate = split_written / elapsed if elapsed > 0 else 0.0
+            return Text(
+                f"{spin} Splitting gene trees | {split_written} written | "
+                f"{rate:.0f}/s | {_fmt_elapsed(elapsed)}"
+            )
+
+        with TickingStatus(_console, _split_render, interval=0.15):
+            trees_dir = materialize_trees_if_needed(
+                Path(trees_path),
+                work_dir=work_dir / "trees_split",
+                on_progress=_split_progress,
+            )
+        _console.print(f"[filter] Split {split_written} gene tree(s).")
 
     tree_dir_rel = Path("Gene_Trees/all_taxa_orthogroups")
     tree_dir = base_dir / tree_dir_rel
@@ -498,9 +556,12 @@ def run_filter_pipeline(args: argparse.Namespace) -> None:
     tree_dir_was_new = newly_created_dir_was(tree_dir)
     fasta_dir_was_new = newly_created_dir_was(fasta_dir)
 
+    _phase("Selecting all-taxa orthogroups (reading GeneCount.tsv)...")
     og_ids = list_all_taxa_orthogroups(og_counts)
+    _console.print(f"[filter] {len(og_ids)} all-taxa orthogroup(s) selected.")
 
     # Copy trees from trees_dir (not base_dir/Gene_Trees)
+    _phase("Copying gene trees for all-taxa orthogroups...")
     copied_trees = copy_gene_trees_for_ids(
         tree_dir=trees_dir,
         ids=og_ids,
@@ -519,7 +580,9 @@ def run_filter_pipeline(args: argparse.Namespace) -> None:
             header = next(reader, None) or []
         species_for_qc = [h for h in header[1:] if h]
 
+    _phase(f"QC: checking per-species monophyly ({len(species_for_qc)} taxa)...")
     good, bad = qc_gene_trees_for_isos(tree_dir, species_for_qc)
+    _phase("Copying FASTAs for good orthogroups...")
     copied_fastas = copy_fastas_for_good_trees(ogseq_dir, good, dst_dir=fasta_dir)
 
     processed_msg_parts: List[str] = []
@@ -531,10 +594,12 @@ def run_filter_pipeline(args: argparse.Namespace) -> None:
             with open(args.taxa_file) as f:
                 taxa_list = [line.strip() for line in f if line.strip()]
         species_fallback = species_from_species_tree(species_tree_path) if species_tree_path else []
-        n_files = run_dedupe_dir_inplace(fasta_dir, taxa_list, species_fallback)
+        _phase("Deduplicating FASTAs by taxon (in-place)...")
+        with _elapsed_spinner("Deduplicating FASTAs"):
+            n_files = run_dedupe_dir_inplace(fasta_dir, taxa_list, species_fallback)
+        _console.print(f"[filter] Deduplicated {n_files} FASTA file(s).")
         processed_msg_parts.append(f"deduped {n_files} FASTA file(s)")
 
-    # Optional clean-labels for FASTA **and** GENE TREES
     # Optional clean-labels for FASTA **and** GENE TREES
     if args.clean_labels:
         _phase("Cleaning labels on FASTAs and gene trees...")

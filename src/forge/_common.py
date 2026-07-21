@@ -34,12 +34,19 @@ def count_fasta_files(d: Path) -> int:
     return n
 
 
-def materialize_trees_if_needed(trees_path: Path, work_dir: Path) -> Path:
+def materialize_trees_if_needed(
+    trees_path: Path,
+    work_dir: Path,
+    on_progress=None,
+) -> Path:
     """
     If trees_path is a directory: return it.
     If it's a file with lines like 'LABEL: <newick>': split into per-tree files:
         <LABEL>_tree.txt
     LABEL can be OG..., tree1, gene_tree1, etc.
+
+    on_progress: optional callable invoked as on_progress(n_written) as trees
+    are written, so a caller can display live progress during a large split.
     """
     if trees_path.is_dir():
         return trees_path
@@ -79,6 +86,11 @@ def materialize_trees_if_needed(trees_path: Path, work_dir: Path) -> Path:
             out = work_dir / f"{out_id}_tree.txt"
             out.write_text(newick + "\n")
             n_written += 1
+            if on_progress is not None and (n_written % 50 == 0):
+                on_progress(n_written)
+
+    if on_progress is not None:
+        on_progress(n_written)
 
     if n_written == 0:
         raise ValueError(f"No trees written from {trees_path}")
