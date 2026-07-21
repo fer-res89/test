@@ -135,7 +135,7 @@ def register(sub, formatter_class) -> None:
     formatter_class=formatter_class,
     ) 
     sp_ded.add_argument("--base-dir", type=Path, default=Path("."),
-                        help="Directory wiht Orthofinder results. Orthobrew will search for Orthogroup_Sequences/all_taxa_fas and Species_Tree/SpeciesTree_rooted.txt if no other arguments are used")
+                        help="Directory wiht Orthofinder results. FORGE will search for Orthogroup_Sequences/all_taxa_fas and Species_Tree/SpeciesTree_rooted.txt if no other arguments are used")
     sp_ded.add_argument("--fasta-dir", type=Path, default=None,
                         help="Target FASTA directory (default: Orthogroup_Sequences/all_taxa_fas)")
     sp_ded.add_argument("--taxa-file", type=str, default=None, help="Taxa list for dedupe (one per line).")

@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import List, Set, Tuple
 
 from rich.console import Console
-from rich.live import Live
 from rich.text import Text
+
+from ._progress import TickingStatus
 
 def _is_blast_db_prefix(p: Path) -> bool:
     return any(
@@ -129,7 +130,6 @@ def run_blast_species(args: argparse.Namespace) -> None:
       --append smart : per-hit decision
     """
     import re
-    import itertools
     import time
     import tempfile
     import threading
@@ -163,17 +163,11 @@ def run_blast_species(args: argparse.Namespace) -> None:
     console = Console(stderr=True)
     console_lock = threading.Lock()
 
-    live_display = None
-    live_active = False
-    last_progress_print_time = 0.0
-    progress_interval = 1.0
+    status: TickingStatus | None = None
 
     def log_console(msg: str) -> None:
         with console_lock:
             console.print(msg)
-
-    def clear_live_status() -> None:
-        return
 
     def render_blast_status(
         *,
@@ -199,12 +193,6 @@ def run_blast_species(args: argparse.Namespace) -> None:
             f"{appended_count}/{total_files} appended",
         ]
         return Text(" | ".join(parts))
-
-    def update_live_status(renderable) -> None:
-        nonlocal live_display
-        if live_active and live_display is not None:
-            with console_lock:
-                live_display.update(renderable, refresh=True)
 
     def file_already_finished(out_fasta: str, log_file: str) -> bool:
         if not (os.path.exists(out_fasta) and os.path.exists(log_file)):
@@ -251,13 +239,6 @@ def run_blast_species(args: argparse.Namespace) -> None:
         r"(?:^|[^A-Z0-9])(?:CM\d+\.\d+|NC_\d+\.\d+|NW_\d+\.\d+|NZ_[A-Z0-9]+\.\d+|[A-Z]{4,10}\d+\.\d+|scaffold|contig|chromosome)(?:[^A-Z0-9]|$)",
         re.IGNORECASE,
     )
-
-    spinner_cycle = itertools.cycle("|/-\\")
-    spinner_lock = threading.Lock()
-
-    def next_spinner() -> str:
-        with spinner_lock:
-            return next(spinner_cycle)
 
     def db_label(db: str) -> str:
         return Path(db).name
@@ -451,7 +432,7 @@ def run_blast_species(args: argparse.Namespace) -> None:
     for db in db_list:
         db_kind_by_db[db] = get_db_kind(db)
 
-    log_console(f"[DEBUG] db_mode={db_mode} n_dbs={len(db_list)} prog={prog} outfmt='{outfmt}'")
+    log_console(f"db_mode={db_mode} n_dbs={len(db_list)} prog={prog} outfmt='{outfmt}'")
 
     fasta_info: Dict[str, Dict[str, str]] = {}
     fasta_logs: Dict[str, List[str]] = {}
@@ -533,13 +514,12 @@ def run_blast_species(args: argparse.Namespace) -> None:
             for line in lines:
                 log_h.write(line + "\n")
 
-    def update_blast_progress(force: bool = False) -> None:
-        nonlocal last_progress_print_time, total_jobs_done
-        now = time.time()
-
-        if not force and (now - last_progress_print_time < progress_interval):
-            return
-
+    def compute_render(spin: str) -> Text:
+        """Pure(ish) renderer: reads shared state, returns a Text.
+        Called by TickingStatus on its own fixed-interval schedule -- this
+        is what keeps the spinner moving even when no BLAST job has
+        finished in a while."""
+        nonlocal total_jobs_done
         eta_str, rate = estimate_eta(total_jobs_done, total_jobs)
 
         with state_lock:
@@ -559,9 +539,7 @@ def run_blast_species(args: argparse.Namespace) -> None:
             appended_count = len(appended_files)
             queued_count = max(0, len(queued_for_append) - appended_count)
 
-        spin = next_spinner()
-
-        renderable = render_blast_status(
+        return render_blast_status(
             started_files=started_files,
             total_files=total_files,
             total_jobs_done=total_jobs_done,
@@ -574,8 +552,15 @@ def run_blast_species(args: argparse.Namespace) -> None:
             appended_count=appended_count,
         )
 
-        update_live_status(renderable)
-        last_progress_print_time = now
+    def update_blast_progress(force: bool = False) -> None:
+        """Ask for an immediate redraw reflecting the latest state (e.g.
+        right after a job starts/finishes), on top of the TickingStatus
+        background ticker that redraws at a constant rate regardless.
+        `force` is accepted for call-site compatibility but no longer
+        gates anything -- the ticker thread is what guarantees the display
+        never goes stale, so there's nothing left to throttle here."""
+        if status is not None:
+            status.refresh()
 
     def append_one_finished_fasta(fasta: str) -> None:
         out_fasta = fasta_info[fasta]["out_fasta"]
@@ -804,29 +789,15 @@ def run_blast_species(args: argparse.Namespace) -> None:
     )
     append_thread.start()
 
-    initial_renderable = render_blast_status(
-        started_files=0,
-        total_files=total_files,
-        total_jobs_done=0,
-        total_jobs=total_jobs,
-        rate=0.0,
-        eta_str="estimating...",
-        spinner=next_spinner(),
-        files_in_progress=0,
-        queued_for_append_count=0,
-        appended_count=0,
-    )
-
     try:
-        with Live(
-            initial_renderable,
-            console=console,
-            refresh_per_second=6,
+        with TickingStatus(
+            console,
+            compute_render,
+            interval=0.15,
+            refresh_per_second=10,
             transient=True,
-            auto_refresh=False,
-        ) as live_ctx:
-            live_display = live_ctx
-            live_active = True
+        ) as ticking_status:
+            status = ticking_status
 
             if len(db_list) == 1:
                 single_db = db_list[0]
@@ -872,7 +843,7 @@ def run_blast_species(args: argparse.Namespace) -> None:
                     max_workers = max(1, int(args.jobs))
 
                 log_console(
-                    f"[DEBUG] multi-db mode: scheduling {len(all_jobs)} jobs "
+                    f"multi-db mode: scheduling {len(all_jobs)} jobs "
                     f"with max_workers={max_workers}, db_threads={multi_db_threads}"
                 )
 
@@ -943,14 +914,11 @@ def run_blast_species(args: argparse.Namespace) -> None:
                 time.sleep(0.2)
 
             update_blast_progress(force=True)
-            live_active = False
-            live_display = None
+            status = None
 
     finally:
         append_queue.put(None)
         append_thread.join()
-
-    clear_live_status()
 
     if append_errors:
         log_console(f"Warning: {len(append_errors)} file(s) had append-thread errors.")

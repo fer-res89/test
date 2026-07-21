@@ -10,8 +10,12 @@ import glob
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+from rich.console import Console
+from rich.text import Text
 
 try:
     from Bio import Phylo  # type: ignore
@@ -32,8 +36,28 @@ from ._common import (
     materialize_trees_if_needed,
     species_from_species_tree,
 )
+from ._progress import TickingStatus
 from .dedupe import run_dedupe_dir_inplace
 from .clean_labels import load_taxon_filter, clean_fasta, clean_newick
+
+_console = Console(stderr=True)
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _estimate_eta(done: int, total: int, start_time: float) -> tuple[str, float]:
+    if done <= 0:
+        return "estimating...", 0.0
+    elapsed = max(time.time() - start_time, 1e-9)
+    rate = done / elapsed
+    remaining = max(total - done, 0)
+    eta_seconds = remaining / rate if rate > 0 else 0.0
+    return _fmt_elapsed(eta_seconds), rate
 
 def verify_expected_inputs(
     og_counts_tsv: Path,
@@ -110,16 +134,28 @@ def copy_gene_trees_for_ids(tree_dir: Path,
     for og, files in og_to_files.items():
         og_to_files[og] = sorted(files, key=lambda x: x.name)
 
-    for tid in ids:
-        files = og_to_files.get(tid, [])
-        if not files:
-            continue
+    ids = list(ids)
+    total = len(ids)
+    done = 0
+    start_time = time.time()
 
-        src = files[0]  # "pick the first"
-        dst = dst_dir / src.name
-        if not dst.exists():
-            shutil.copy2(src, dst)
-        copied.append(dst)
+    def render(spin: str) -> Text:
+        eta_str, rate = _estimate_eta(done, total, start_time)
+        return Text(
+            f"{spin} Copying gene trees | {done}/{total} | "
+            f"{rate:.1f}/s | ETA {eta_str}"
+        )
+
+    with TickingStatus(_console, render, interval=0.15):
+        for tid in ids:
+            files = og_to_files.get(tid, [])
+            if files:
+                src = files[0]  # "pick the first"
+                dst = dst_dir / src.name
+                if not dst.exists():
+                    shutil.copy2(src, dst)
+                copied.append(dst)
+            done += 1
 
     return copied
 
@@ -151,15 +187,48 @@ def iter_tree_files(tree_dir: Path):
             yield p
 
 def qc_gene_trees_for_isos(tree_dir: Path, species_list: List[str]) -> Tuple[List[str], List[str]]:
-    good, bad = [], []
-    for p in sorted(iter_tree_files(tree_dir)):
-        try:
-            txt, t = open_tree_file(p)
-        except Exception:
-            bad.append(p.name)
-            continue
-        flags = [is_species_multiplicity_monophyletic(t, sp) for sp in species_list]
-        (good if all(flags) else bad).append(p.name)
+    files = sorted(iter_tree_files(tree_dir))
+    total = len(files)
+    good: List[str] = []
+    bad: List[str] = []
+    done = 0
+    current_name = ""
+    start_time = time.time()
+
+    # Single-threaded loop: `done`/`current_name` are only ever written by
+    # this thread. TickingStatus's ticker thread only reads them for display,
+    # so no lock is needed here (unlike blast-species, which has multiple
+    # worker threads mutating shared counters).
+    def render(spin: str) -> Text:
+        eta_str, rate = _estimate_eta(done, total, start_time)
+        parts = [
+            f"{spin} QC'ing gene trees",
+            f"{done}/{total} trees",
+            f"{rate:.1f} trees/s",
+            f"ETA {eta_str}",
+        ]
+        if current_name:
+            parts.append(f"current: {current_name}")
+        return Text(" | ".join(parts))
+
+    with TickingStatus(_console, render, interval=0.15) as status:
+        for p in files:
+            current_name = p.name
+            try:
+                txt, t = open_tree_file(p)
+            except Exception:
+                bad.append(p.name)
+            else:
+                flags = [is_species_multiplicity_monophyletic(t, sp) for sp in species_list]
+                (good if all(flags) else bad).append(p.name)
+            done += 1
+
+    elapsed = time.time() - start_time
+    _console.print(
+        f"QC'd {total} gene tree(s) in {_fmt_elapsed(elapsed)}: "
+        f"{len(good)} good, {len(bad)} bad"
+    )
+
     (tree_dir / "good_tree_files.list").write_text("\n".join(good) + "\n")
     (tree_dir / "bad_tree_files.list").write_text("\n".join(bad) + "\n")
     return good, bad
@@ -178,21 +247,35 @@ def copy_fastas_for_good_trees(ogseq_dir: Path,
     copied: List[Path] = []
     missing: List[str] = []
 
-    for tree_name in sorted(good_tree_fnames):
-        tid = extract_tree_id_from_filename(tree_name)
+    tree_names = sorted(good_tree_fnames)
+    total = len(tree_names)
+    done = 0
+    start_time = time.time()
 
-        found = False
-        for ext in (".fa", ".fas", ".fasta", ".FA", ".FAS", ".FASTA"):
-            cand = ogseq_dir / f"{tid}{ext}"
-            if cand.is_file():
-                dst = dst_dir / cand.name
-                dst.write_bytes(cand.read_bytes())
-                copied.append(dst)
-                found = True
-                break
+    def render(spin: str) -> Text:
+        eta_str, rate = _estimate_eta(done, total, start_time)
+        return Text(
+            f"{spin} Copying FASTAs | {done}/{total} | "
+            f"{rate:.1f}/s | ETA {eta_str}"
+        )
 
-        if not found:
-            missing.append(tid)
+    with TickingStatus(_console, render, interval=0.15):
+        for tree_name in tree_names:
+            tid = extract_tree_id_from_filename(tree_name)
+
+            found = False
+            for ext in (".fa", ".fas", ".fasta", ".FA", ".FAS", ".FASTA"):
+                cand = ogseq_dir / f"{tid}{ext}"
+                if cand.is_file():
+                    dst = dst_dir / cand.name
+                    dst.write_bytes(cand.read_bytes())
+                    copied.append(dst)
+                    found = True
+                    break
+
+            if not found:
+                missing.append(tid)
+            done += 1
 
     rpt = dst_dir / "missing_fastas_for_good_trees.txt"
     if missing:
