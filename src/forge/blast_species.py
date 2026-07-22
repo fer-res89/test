@@ -265,6 +265,18 @@ def run_blast_species(args: argparse.Namespace) -> None:
         if cached is not None:
             return cached
 
+        # blastdbcmd only finds taxdb.bti/taxdb.btd via the BLASTDB env var
+        # (or cwd) -- it does NOT automatically check the directory the DB
+        # itself lives in. Since we already know exactly where this DB is,
+        # explicitly put its directory on BLASTDB for this call, so taxonomy
+        # lookups work regardless of the caller's shell environment or
+        # working directory (as long as the taxdb files are colocated with
+        # the DB, which is the standard/recommended setup anyway).
+        env = os.environ.copy()
+        db_dir = os.path.dirname(os.path.abspath(hit_db)) or "."
+        existing_blastdb = env.get("BLASTDB", "")
+        env["BLASTDB"] = db_dir + (os.pathsep + existing_blastdb if existing_blastdb else "")
+
         name = None
         try:
             proc = subprocess.run(
@@ -273,6 +285,7 @@ def run_blast_species(args: argparse.Namespace) -> None:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=True,
+                env=env,
             )
             out_lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
             if out_lines:
@@ -285,8 +298,9 @@ def run_blast_species(args: argparse.Namespace) -> None:
             log_console(
                 f"Warning: could not resolve a scientific name for taxid {taxid} "
                 f"(db={db_label(hit_db)}, entry={entry_id}); using placeholder "
-                f"'{name}'. Is this BLAST DB missing taxonomy info "
-                f"(taxdb.bti/taxdb.btd, or built without -taxid_map)?"
+                f"'{name}'. Checked BLASTDB={env['BLASTDB']!r} for "
+                f"taxdb.bti/taxdb.btd -- confirm those files are actually "
+                f"there and not truncated (e.g. 'tar -tzf taxdb.tar.gz')."
             )
         else:
             name = re.sub(r"\s+", "_", name)
