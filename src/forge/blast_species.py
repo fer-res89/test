@@ -562,6 +562,18 @@ def run_blast_species(args: argparse.Namespace) -> None:
             except OSError:
                 pass  # cached file unreadable -- fall through and re-search
 
+        # Write to a temp file first, then atomically rename to
+        # cached_result_path ONLY after BLAST confirms success. This matters:
+        # if -out pointed directly at cached_result_path, an interrupted run
+        # (Ctrl+C mid-search) would leave an empty/truncated file sitting at
+        # that exact path -- which os.path.exists() can't distinguish from a
+        # genuinely completed result. A subsequent --resume would then treat
+        # that stub as "already searched" and silently skip it forever,
+        # parsing zero hits from an empty file instead of re-running BLAST.
+        # The atomic rename guarantees cached_result_path only ever exists
+        # once fully written -- there's no window where a partial file can
+        # appear under that name.
+        tmp_result_path = cached_result_path + f".tmp.{os.getpid()}.{threading.get_ident()}"
         cmd = [
             blast_prog,
             "-query", combined_query,
@@ -570,7 +582,7 @@ def run_blast_species(args: argparse.Namespace) -> None:
             "-max_target_seqs", "50",
             "-max_hsps", "1",
             "-outfmt", outfmt_batch,
-            "-out", cached_result_path,
+            "-out", tmp_result_path,
         ]
         if extra_args:
             cmd.extend(extra_args)
@@ -578,10 +590,30 @@ def run_blast_species(args: argparse.Namespace) -> None:
         try:
             subprocess.run(cmd, check=True)
         except FileNotFoundError:
+            try:
+                os.remove(tmp_result_path)
+            except OSError:
+                pass
             raise RuntimeError(f"Error: '{blast_prog}' not found on PATH. Install BLAST+ and try again.")
         except subprocess.CalledProcessError as e:
             worker_logs.append(f"BLAST failed for db={db_label(hit_db)} (batch query): {e}")
+            try:
+                os.remove(tmp_result_path)
+            except OSError:
+                pass
             return hit_db, None, worker_logs
+        except BaseException:
+            # Covers Ctrl+C (KeyboardInterrupt) and any other interruption
+            # reaching this point: clean up the temp file so it can't be
+            # confused with a real (never-created, since we never got here)
+            # cached_result_path, then re-raise.
+            try:
+                os.remove(tmp_result_path)
+            except OSError:
+                pass
+            raise
+
+        os.replace(tmp_result_path, cached_result_path)
 
         best_by_qseqid = parse_best_hits_grouped_by_qseqid(cached_result_path, prog_name)
         return hit_db, best_by_qseqid, worker_logs
