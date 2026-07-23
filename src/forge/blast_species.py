@@ -204,27 +204,32 @@ def run_blast_species(args: argparse.Namespace) -> None:
 
     def render_blast_status(
         *,
-        started_files: int,
-        total_files: int,
         total_jobs_done: int,
         total_jobs: int,
         rate: float,
         eta_str: str,
+        elapsed_str: str,
         spinner: str,
-        files_in_progress: int,
-        queued_for_append_count: int,
-        appended_count: int,
+        appended_count: "int | None" = None,
+        total_files: "int | None" = None,
     ) -> Text:
         parts = [
             f"{spinner} Blasting",
-            f"{started_files}/{total_files} files active/started",
-            f"{files_in_progress} files in progress",
             f"{total_jobs_done}/{total_jobs} jobs done",
             f"{rate:.2f} jobs/s",
             f"ETA {eta_str}",
-            f"{queued_for_append_count} queued for append",
-            f"{appended_count}/{total_files} appended",
+            f"Elapsed {elapsed_str}",
         ]
+        # Per-file mode: files finish (and get appended) incrementally
+        # throughout the run, so "N/total files appended" is a meaningful
+        # ratio. Batch mode appends individual HITS incrementally instead
+        # (one per (file, db) pair, as each db finishes) with no fixed total
+        # to compare against, so it gets a running count with no
+        # denominator rather than a ratio that doesn't mean anything.
+        if appended_count is not None and total_files is not None:
+            parts.append(f"{appended_count}/{total_files} appended")
+        elif appended_count is not None:
+            parts.append(f"{appended_count} hits appended so far")
         return Text(" | ".join(parts))
 
     def file_already_finished(out_fasta: str, log_file: str) -> bool:
@@ -523,16 +528,39 @@ def run_blast_species(args: argparse.Namespace) -> None:
         blast_threads: int,
         outfmt_batch: str,
         extra_args: list[str],
+        cached_result_path: str,
+        use_resume: bool,
     ):
         """Batch-query-mode search: ONE blast process for this DB, searching
         every query at once, instead of one process per (fasta, db) pair.
         This is the whole point of batch mode -- eliminating the repeated
         per-query DB-load/setup overhead that dominates when each query gets
-        its own tiny process."""
-        worker_logs: List[str] = []
+        its own tiny process.
 
-        with tempfile.NamedTemporaryFile(mode="w+", suffix=".tsv", delete=False) as tmp:
-            per_db_res = tmp.name
+        Unlike per-file mode, nothing gets appended to any output file until
+        EVERY db has been searched (only then do we know, for each file,
+        which db had its single best hit). That means a crash partway
+        through a long batch run could otherwise lose all completed search
+        work with nothing to show for it. To avoid that: results are written
+        to `cached_result_path` (persistent, not a deleted temp file) instead
+        of being thrown away after parsing. On a subsequent --resume run, if
+        that file already exists, BLAST is skipped entirely for this db and
+        the existing results are just re-parsed -- so a crash only costs you
+        the db(s) that hadn't finished yet, not everything that had.
+        """
+        worker_logs: List[str] = []
+        prog_name = os.path.basename(blast_prog).lower()
+
+        if use_resume and os.path.exists(cached_result_path):
+            try:
+                best_by_qseqid = parse_best_hits_grouped_by_qseqid(cached_result_path, prog_name)
+                worker_logs.append(
+                    f"Resumed db={db_label(hit_db)} from a previously-completed "
+                    f"batch search (skipped re-running BLAST for this db)"
+                )
+                return hit_db, best_by_qseqid, worker_logs
+            except OSError:
+                pass  # cached file unreadable -- fall through and re-search
 
         cmd = [
             blast_prog,
@@ -542,7 +570,7 @@ def run_blast_species(args: argparse.Namespace) -> None:
             "-max_target_seqs", "50",
             "-max_hsps", "1",
             "-outfmt", outfmt_batch,
-            "-out", per_db_res,
+            "-out", cached_result_path,
         ]
         if extra_args:
             cmd.extend(extra_args)
@@ -550,29 +578,12 @@ def run_blast_species(args: argparse.Namespace) -> None:
         try:
             subprocess.run(cmd, check=True)
         except FileNotFoundError:
-            try:
-                os.remove(per_db_res)
-            except OSError:
-                pass
             raise RuntimeError(f"Error: '{blast_prog}' not found on PATH. Install BLAST+ and try again.")
         except subprocess.CalledProcessError as e:
             worker_logs.append(f"BLAST failed for db={db_label(hit_db)} (batch query): {e}")
-            try:
-                os.remove(per_db_res)
-            except OSError:
-                pass
             return hit_db, None, worker_logs
 
-        try:
-            best_by_qseqid = parse_best_hits_grouped_by_qseqid(
-                per_db_res, os.path.basename(blast_prog).lower()
-            )
-        finally:
-            try:
-                os.remove(per_db_res)
-            except OSError:
-                pass
-
+        best_by_qseqid = parse_best_hits_grouped_by_qseqid(cached_result_path, prog_name)
         return hit_db, best_by_qseqid, worker_logs
 
     def search_one_fasta_db(
@@ -656,6 +667,12 @@ def run_blast_species(args: argparse.Namespace) -> None:
     fasta_info: Dict[str, Dict[str, str]] = {}
     fasta_logs: Dict[str, List[str]] = {}
     best_hits_by_fasta: Dict[str, Dict[str, tuple]] = {}
+    # Running per-fasta appended-hit count. Populated incrementally in batch
+    # mode (as each db's hits get appended); in per-file mode it's left empty
+    # and the status line falls back to the existing appended_files-based
+    # count instead, since per-file mode's append still happens in one shot
+    # per fasta rather than incrementally per db.
+    total_appended_by_fasta: Dict[str, int] = {}
 
     global_log_file = "blast_species.global.log"
     if not (getattr(args, "resume", False) and os.path.exists(global_log_file)):
@@ -667,6 +684,7 @@ def run_blast_species(args: argparse.Namespace) -> None:
 
     files_to_run: List[str] = []
     skipped_files: List[str] = []
+    is_batch_query_mode_early = getattr(args, "query_mode", "per-file") == "batch"
 
     for fasta in fasta_files:
         base = fasta[:-len(args.e)] if args.e else os.path.splitext(fasta)[0]
@@ -681,15 +699,50 @@ def run_blast_species(args: argparse.Namespace) -> None:
             append_global_log_line(global_log_file, f'Skipping finished "{fasta}" → "{out_fasta}"')
             continue
 
-        fasta_logs[fasta] = [
-            f'Processing "{fasta}" → "{out_fasta}"',
-            f"db_mode={db_mode} n_dbs={len(db_list)} prog={prog} outfmt={outfmt}",
-        ]
+        # Batch mode can have a file that's NOT fully finished yet still
+        # carry genuine partial progress from a previous (crashed) run --
+        # some (fasta, db) hits already durably appended, tracked via
+        # [APPENDED_DB] markers in its log. Per-file mode never has this
+        # state (nothing gets written until a file's full hit set is ready),
+        # so this only matters in batch mode. Detect it BEFORE deciding
+        # whether to reset out_fasta/the in-memory log, so we don't destroy
+        # hits that were already safely on disk.
+        has_partial_batch_progress = False
+        if is_batch_query_mode_early and getattr(args, "resume", False):
+            existing_markers: Set[str] = set()
+            if os.path.exists(log_file):
+                try:
+                    with open(log_file) as lf:
+                        for line in lf:
+                            line = line.strip()
+                            if line.startswith("[APPENDED_DB] "):
+                                existing_markers.add(line[len("[APPENDED_DB] "):].strip())
+                except OSError:
+                    existing_markers = set()
+            has_partial_batch_progress = bool(existing_markers) and os.path.exists(out_fasta)
+
+        if has_partial_batch_progress:
+            # Preserve on-disk content and seed the in-memory log with what's
+            # already there, so write_one_fasta_log appends to history
+            # instead of replacing it (which would silently drop the
+            # [APPENDED_DB] markers this whole mechanism depends on).
+            try:
+                with open(log_file) as lf:
+                    fasta_logs[fasta] = [ln.rstrip("\n") for ln in lf]
+            except OSError:
+                fasta_logs[fasta] = []
+            fasta_logs[fasta].append(
+                f'Resuming "{fasta}" -> "{out_fasta}" (preserving already-appended hits)'
+            )
+        else:
+            fasta_logs[fasta] = [
+                f'Processing "{fasta}" → "{out_fasta}"',
+                f"db_mode={db_mode} n_dbs={len(db_list)} prog={prog} outfmt={outfmt}",
+            ]
+            with open(out_fasta, "w") as out_h, open(fasta) as in_h:
+                out_h.write(in_h.read())
 
         append_global_log_line(global_log_file, f'Processing "{fasta}" → "{out_fasta}"')
-
-        with open(out_fasta, "w") as out_h, open(fasta) as in_h:
-            out_h.write(in_h.read())
 
         files_to_run.append(fasta)
 
@@ -733,6 +786,27 @@ def run_blast_species(args: argparse.Namespace) -> None:
             for line in lines:
                 log_h.write(line + "\n")
 
+    def load_already_appended_dbs(fasta: str) -> Set[str]:
+        """Batch-mode resume support: each successful append writes a
+        machine-parseable '[APPENDED_DB] <label>' marker line (in addition
+        to its descriptive log line). On --resume, read a fasta's existing
+        .blast.log (if any) and collect those markers, so hits from dbs
+        already appended in a prior (possibly crashed) run are never
+        appended a second time."""
+        log_file = fasta_info.get(fasta, {}).get("log_file")
+        if not log_file or not os.path.exists(log_file):
+            return set()
+        done: Set[str] = set()
+        try:
+            with open(log_file) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("[APPENDED_DB] "):
+                        done.add(line[len("[APPENDED_DB] "):].strip())
+        except OSError:
+            return set()
+        return done
+
     def compute_render(spin: str) -> Text:
         """Pure(ish) renderer: reads shared state, returns a Text.
         Called by TickingStatus on its own fixed-interval schedule -- this
@@ -740,35 +814,31 @@ def run_blast_species(args: argparse.Namespace) -> None:
         finished in a while."""
         nonlocal total_jobs_done
         eta_str, rate = estimate_eta(total_jobs_done, total_jobs)
+        elapsed_str = fmt_elapsed(time.time() - run_start)
 
-        with state_lock:
-            started_files = sum(
-                1
-                for f in files_to_run
-                if completed_jobs_by_fasta.get(f, 0) > 0 or active_db_counts.get(f, 0) > 0
-            )
-
-            files_in_progress = sum(
-                1
-                for f in files_to_run
-                if 0 < completed_jobs_by_fasta.get(f, 0) < len(db_list)
-            )
-
-        with append_state_lock:
-            appended_count = len(appended_files)
-            queued_count = max(0, len(queued_for_append) - appended_count)
+        is_batch = getattr(args, "query_mode", "per-file") == "batch"
+        appended_count = None
+        show_total_files = None
+        if is_batch:
+            with append_state_lock:
+                appended_count = sum(total_appended_by_fasta.values())
+            # No natural fixed denominator for "hits appended" in batch mode
+            # (unlike per-file mode's N/total-files), so show a running
+            # count only.
+        else:
+            with append_state_lock:
+                appended_count = len(appended_files)
+            show_total_files = total_files
 
         return render_blast_status(
-            started_files=started_files,
-            total_files=total_files,
             total_jobs_done=total_jobs_done,
             total_jobs=total_jobs,
             rate=rate,
             eta_str=eta_str,
+            elapsed_str=elapsed_str,
             spinner=spin,
-            files_in_progress=files_in_progress,
-            queued_for_append_count=queued_count,
             appended_count=appended_count,
+            total_files=show_total_files,
         )
 
     def update_blast_progress(force: bool = False) -> None:
@@ -781,65 +851,70 @@ def run_blast_species(args: argparse.Namespace) -> None:
         if status is not None:
             status.refresh()
 
-    def append_one_finished_fasta(fasta: str) -> None:
+    fasta_append_locks: Dict[str, threading.Lock] = {fasta: threading.Lock() for fasta in files_to_run}
+
+    def format_and_append_one_hit(fasta: str, hit_db: str, taxid: str, payload: tuple) -> tuple[List[str], bool]:
+        """Append ONE (fasta, db) hit to fasta's out_fasta file right now --
+        a true, permanent file append, not part of a larger batched rewrite.
+        Returns (log_lines, appended_ok). Safe to call concurrently for
+        DIFFERENT fastas; calls for the SAME fasta (which can happen in
+        batch mode, where multiple DBs' results land around the same time)
+        are serialized via fasta_append_locks so two hits never interleave
+        their writes to the same file.
+
+        This is the exact per-hit logic previously inlined in
+        append_one_finished_fasta's per-db loop, factored out so it can be
+        invoked immediately per (fasta, db) pair -- in per-file mode once a
+        fasta's own jobs are all done (unchanged from before), and in batch
+        mode the moment EACH db's combined search returns, without waiting
+        for every other db too.
+        """
         out_fasta = fasta_info[fasta]["out_fasta"]
-        best_hits = best_hits_by_fasta[fasta]
-
-        if not best_hits:
-            with append_state_lock:
-                fasta_logs[fasta].append(f"No BLAST hits found in {fasta}")
-                fasta_logs[fasta].append(f"Appended 0 sequence(s) to {out_fasta}")
-            write_one_fasta_log(fasta)
-            log_console(f'Finished "{fasta}": appended 0 sequence(s)')
-            return
-
-        appended = 0
+        entry_id = payload[0]
+        score = payload[1]
+        db_kind = db_kind_by_db.get(hit_db, "unknown")
         local_log_lines: List[str] = []
+        mode = append_mode
 
-        for hit_db in db_list:
-            if hit_db not in best_hits:
-                continue
-
-            _db_key, taxid, payload = best_hits[hit_db]
-            entry_id = payload[0]
-            score = payload[1]
-            db_kind = db_kind_by_db.get(hit_db, "unknown")
-
-            mode = append_mode
-
-            if mode == "smart":
-                if is_blastp or is_blastx:
+        if mode == "smart":
+            if is_blastp or is_blastx:
+                mode = "full"
+            elif is_tblastn:
+                if transcript_like.search(entry_id):
                     mode = "full"
-                elif is_tblastn:
-                    if transcript_like.search(entry_id):
-                        mode = "full"
-                    elif contig_like.search(entry_id):
-                        mode = "range"
-                    else:
-                        mode = "range"
-                elif is_blastn:
-                    if transcript_like.search(entry_id):
-                        mode = "full"
-                    elif contig_like.search(entry_id):
-                        mode = "range"
-                    else:
-                        mode = "full"
+                elif contig_like.search(entry_id):
+                    mode = "range"
+                else:
+                    mode = "range"
+            elif is_blastn:
+                if transcript_like.search(entry_id):
+                    mode = "full"
+                elif contig_like.search(entry_id):
+                    mode = "range"
                 else:
                     mode = "full"
+            else:
+                mode = "full"
 
-                local_log_lines.append(
-                    f"smart decision: db={db_label(hit_db)} entry_id={entry_id!r} "
-                    f"db_kind={db_kind!r} contig_match={bool(contig_like.search(entry_id))} "
-                    f"transcript_match={bool(transcript_like.search(entry_id))} mode={mode!r}"
-                )
+            local_log_lines.append(
+                f"smart decision: db={db_label(hit_db)} entry_id={entry_id!r} "
+                f"db_kind={db_kind!r} contig_match={bool(contig_like.search(entry_id))} "
+                f"transcript_match={bool(transcript_like.search(entry_id))} mode={mode!r}"
+            )
 
+        lock = fasta_append_locks.get(fasta)
+        if lock is None:
+            lock = threading.Lock()
+            fasta_append_locks[fasta] = lock
+
+        with lock:
             if mode == "range":
                 if is_tblastn:
                     _, _, sstart, send, sframe, sseq = payload
                     aa = sseq.replace("-", "").replace("*", "").strip()
                     if not aa:
                         log_console(f"Warning: empty HSP AA for {entry_id} taxid {taxid}")
-                        continue
+                        return local_log_lines, False
 
                     start = min(sstart, send)
                     end = max(sstart, send)
@@ -851,13 +926,13 @@ def run_blast_species(args: argparse.Namespace) -> None:
                         for i in range(0, len(aa), 60):
                             out_h.write(aa[i:i+60] + "\n")
 
-                    appended += 1
                     local_log_lines.append(
                         f"Appended RANGE-AA (tblastn HSP) for taxid {taxid} "
                         f"({species_name}): {entry_id} HSP {start}-{end} "
                         f"frame {sframe} from {db_label(hit_db)} (bitscore {score})"
                     )
-                    continue
+                    local_log_lines.append(f"[APPENDED_DB] {db_label(hit_db)}")
+                    return local_log_lines, True
 
                 if is_blastn:
                     _, _, sstart, send, sstrand = payload
@@ -875,7 +950,7 @@ def run_blast_species(args: argparse.Namespace) -> None:
                         )
                     except subprocess.CalledProcessError:
                         log_console(f"Warning: range fetch failed for {entry_id}:{start}-{end} from {hit_db}")
-                        continue
+                        return local_log_lines, False
 
                     lines = proc.stdout.splitlines()
                     species_name = resolve_species_name(hit_db, entry_id, taxid)
@@ -885,13 +960,13 @@ def run_blast_species(args: argparse.Namespace) -> None:
                     with open(out_fasta, "a") as out_h:
                         out_h.write("\n".join(lines) + ("\n" if lines else ""))
 
-                    appended += 1
                     local_log_lines.append(
                         f"Appended RANGE-DNA (blastn HSP) for taxid {taxid} "
                         f"({species_name}): {entry_id} HSP {start}-{end} "
                         f"strand {strand} from {db_label(hit_db)} (bitscore {score})"
                     )
-                    continue
+                    local_log_lines.append(f"[APPENDED_DB] {db_label(hit_db)}")
+                    return local_log_lines, True
 
                 mode = "full"
 
@@ -901,11 +976,11 @@ def run_blast_species(args: argparse.Namespace) -> None:
                     transcript_hit = bool(transcript_like.search(entry_id))
                     if contig_hit and not transcript_hit:
                         log_console(f"Warning: refusing FULL fetch for contig-like ID in smart mode: {entry_id}")
-                        continue
+                        return local_log_lines, False
 
                 full = fetch_full_subject(hit_db, entry_id)
                 if not full:
-                    continue
+                    return local_log_lines, False
 
                 if append_mode == "smart" and is_blastn:
                     bp = full_bp(full)
@@ -928,7 +1003,7 @@ def run_blast_species(args: argparse.Namespace) -> None:
                                 log_console(
                                     f"Warning: full too big ({bp} bp) and range fallback failed for {entry_id} from {hit_db}"
                                 )
-                                continue
+                                return local_log_lines, False
 
                             lines = proc.stdout.splitlines()
                             species_name = resolve_species_name(hit_db, entry_id, taxid)
@@ -938,13 +1013,13 @@ def run_blast_species(args: argparse.Namespace) -> None:
                             with open(out_fasta, "a") as out_h:
                                 out_h.write("\n".join(lines) + ("\n" if lines else ""))
 
-                            appended += 1
                             local_log_lines.append(
                                 f"Appended RANGE-DNA fallback for taxid {taxid} "
                                 f"({species_name}): {entry_id} HSP {start}-{end} "
                                 f"strand {strand} from {db_label(hit_db)} (bitscore {score})"
                             )
-                            continue
+                            local_log_lines.append(f"[APPENDED_DB] {db_label(hit_db)}")
+                            return local_log_lines, True
                         else:
                             log_console(
                                 f"Warning: full too big ({bp} bp) for {entry_id} but no coords available; "
@@ -954,12 +1029,38 @@ def run_blast_species(args: argparse.Namespace) -> None:
                 with open(out_fasta, "a") as out_h:
                     out_h.write(full if full.endswith("\n") else full + "\n")
 
-                appended += 1
                 local_log_lines.append(
                     f"Appended FULL for taxid {taxid}: {entry_id} "
                     f"from {db_label(hit_db)} (bitscore {score})"
                 )
+                local_log_lines.append(f"[APPENDED_DB] {db_label(hit_db)}")
+                return local_log_lines, True
+
+        return local_log_lines, False
+
+    def append_one_finished_fasta(fasta: str) -> None:
+        out_fasta = fasta_info[fasta]["out_fasta"]
+        best_hits = best_hits_by_fasta[fasta]
+
+        if not best_hits:
+            with append_state_lock:
+                fasta_logs[fasta].append(f"No BLAST hits found in {fasta}")
+                fasta_logs[fasta].append(f"Appended 0 sequence(s) to {out_fasta}")
+            write_one_fasta_log(fasta)
+            log_console(f'Finished "{fasta}": appended 0 sequence(s)')
+            return
+
+        appended = 0
+        local_log_lines: List[str] = []
+
+        for hit_db in db_list:
+            if hit_db not in best_hits:
                 continue
+            _db_key, taxid, payload = best_hits[hit_db]
+            hit_log_lines, ok = format_and_append_one_hit(fasta, hit_db, taxid, payload)
+            local_log_lines.extend(hit_log_lines)
+            if ok:
+                appended += 1
 
         local_log_lines.append(f"Appended {appended} sequence(s) to {out_fasta}")
 
@@ -1016,17 +1117,20 @@ def run_blast_species(args: argparse.Namespace) -> None:
     # most cores idle once the search phase races ahead of a single-threaded
     # append queue. --append-workers lets that stage scale independently.
     n_append_workers = max(1, int(getattr(args, "append_workers", 8)))
+    is_batch_query_mode = getattr(args, "query_mode", "per-file") == "batch"
 
-    append_threads = [
-        threading.Thread(
-            target=append_worker,
-            name=f"blast-species-append-worker-{i}",
-            daemon=True,
-        )
-        for i in range(n_append_workers)
-    ]
-    for t in append_threads:
-        t.start()
+    append_threads: List[threading.Thread] = []
+    if not is_batch_query_mode:
+        append_threads = [
+            threading.Thread(
+                target=append_worker,
+                name=f"blast-species-append-worker-{i}",
+                daemon=True,
+            )
+            for i in range(n_append_workers)
+        ]
+        for t in append_threads:
+            t.start()
 
     try:
         with TickingStatus(
@@ -1042,6 +1146,14 @@ def run_blast_species(args: argparse.Namespace) -> None:
                 batch_work_dir = tempfile.mkdtemp(prefix="forge_batch_query_")
                 combined_query_path = os.path.join(batch_work_dir, "combined_queries.fasta")
 
+                # Persistent (NOT cleaned up automatically) per-db SEARCH
+                # results, so a crash mid-run doesn't lose already-completed
+                # BLAST searches. --resume reuses any db's result here
+                # instead of re-running BLAST for it.
+                batch_results_dir = "forge_batch_results"
+                os.makedirs(batch_results_dir, exist_ok=True)
+                use_batch_resume = bool(getattr(args, "resume", False))
+
                 log_console(
                     f"[DEBUG] batch-query mode: combining {len(files_to_run)} "
                     f"query file(s) into one multi-FASTA for {len(db_list)} db job(s)"
@@ -1055,10 +1167,90 @@ def run_blast_species(args: argparse.Namespace) -> None:
                 else:
                     max_workers = max(1, int(args.jobs))
 
+                # Each db's hits get appended to their files the moment that
+                # db's search returns -- there's no need to wait for every
+                # other db first, since each db is an independent genome and
+                # every db's best hit for a file is appended regardless of
+                # what any other db found (this is exactly what --append
+                # range already does in per-file mode: one appended sequence
+                # per db, not a single cross-db winner). Per-(fasta, db)
+                # append tracking (not just per-db SEARCH tracking) means a
+                # crash loses only whatever hadn't been appended yet, down to
+                # the individual (file, db) pair -- not a whole run's worth
+                # of completed searches, and not even a whole db's worth of
+                # appends.
+                for fasta in files_to_run:
+                    total_appended_by_fasta[fasta] = 0
+                already_appended_dbs_by_fasta: Dict[str, Set[str]] = {}
+                if use_batch_resume:
+                    n_partially_done = 0
+                    for fasta in files_to_run:
+                        done_dbs = load_already_appended_dbs(fasta)
+                        if done_dbs:
+                            already_appended_dbs_by_fasta[fasta] = done_dbs
+                            total_appended_by_fasta[fasta] = len(done_dbs)
+                            n_partially_done += 1
+                    if n_partially_done:
+                        log_console(
+                            f"[DEBUG] batch-query mode: {n_partially_done} file(s) have "
+                            f"some hits already appended from a previous run and will "
+                            f"only get NEW dbs appended, not re-appended"
+                        )
+
+                    n_cached = sum(
+                        1 for db in db_list
+                        if os.path.exists(os.path.join(batch_results_dir, f"{db_label(db)}.tsv"))
+                    )
+                    log_console(
+                        f"[DEBUG] batch-query mode: {n_cached}/{len(db_list)} db(s) "
+                        f"already have a cached search result and will be re-parsed, not re-searched"
+                    )
+
                 log_console(
                     f"[DEBUG] batch-query mode: scheduling {len(db_list)} db job(s) "
                     f"with max_workers={max_workers}, db_threads={multi_db_threads}"
                 )
+
+                # Dedicated append pool for batch mode: hits get queued as
+                # each db finishes (not once at the very end), so this needs
+                # to be running throughout the search phase, not started
+                # after it like per-file mode's queue_ready_fasta_for_append.
+                batch_append_queue: queue.Queue = queue.Queue()
+
+                def batch_append_worker() -> None:
+                    while True:
+                        item = batch_append_queue.get()
+                        try:
+                            if item is None:
+                                return
+                            b_fasta, b_hit_db, b_taxid, b_payload = item
+                            hit_log_lines, ok = format_and_append_one_hit(
+                                b_fasta, b_hit_db, b_taxid, b_payload
+                            )
+                            with append_state_lock:
+                                fasta_logs[b_fasta].extend(hit_log_lines)
+                                if ok:
+                                    total_appended_by_fasta[b_fasta] = (
+                                        total_appended_by_fasta.get(b_fasta, 0) + 1
+                                    )
+                            write_one_fasta_log(b_fasta)
+                        except Exception as e:
+                            with append_state_lock:
+                                append_errors.append((str(item), str(e)))
+                            log_console(f"Error while appending batch hit {item}: {e}")
+                        finally:
+                            batch_append_queue.task_done()
+
+                batch_append_threads = [
+                    threading.Thread(
+                        target=batch_append_worker,
+                        name=f"blast-species-batch-append-worker-{i}",
+                        daemon=True,
+                    )
+                    for i in range(n_append_workers)
+                ]
+                for t in batch_append_threads:
+                    t.start()
 
                 with ThreadPoolExecutor(max_workers=max_workers) as ex:
                     futures = {
@@ -1070,6 +1262,8 @@ def run_blast_species(args: argparse.Namespace) -> None:
                             multi_db_threads,
                             outfmt_batch,
                             args.extra,
+                            os.path.join(batch_results_dir, f"{db_label(db)}.tsv"),
+                            use_batch_resume,
                         ): db
                         for db in db_list
                     }
@@ -1122,18 +1316,42 @@ def run_blast_species(args: argparse.Namespace) -> None:
                                 completed_jobs_by_fasta[fasta] += 1
                                 total_jobs_done += 1
 
+                        # Queue this db's hits for immediate appending --
+                        # skipping any (fasta, db) pair already appended in a
+                        # prior run, per that fasta's own log manifest.
+                        db_label_str = db_label(hit_db)
                         for fasta, (taxid, payload) in best_by_fasta_for_this_db.items():
-                            best_hits_by_fasta[fasta][hit_db] = (hit_db, taxid, payload)
+                            if db_label_str in already_appended_dbs_by_fasta.get(fasta, ()):
+                                continue
+                            batch_append_queue.put((fasta, hit_db, taxid, payload))
 
                         update_blast_progress(force=True)
 
+                # Drain all queued hit-appends before declaring any file
+                # finished -- otherwise the final summary below could run
+                # ahead of appends still in flight.
+                batch_append_queue.join()
+                for _ in batch_append_threads:
+                    batch_append_queue.put(None)
+                for t in batch_append_threads:
+                    t.join()
+
                 shutil.rmtree(batch_work_dir, ignore_errors=True)
 
-                # Every file becomes "ready" for append at the same moment in
-                # batch mode: completed_jobs_by_fasta only reaches len(db_list)
-                # for ALL files simultaneously, once the last DB job returns.
+                # Every file's hits are now fully and permanently appended
+                # (whether from this run or reused from a previous one).
+                # Write the true completion marker per file -- the same
+                # phrase file_already_finished() looks for -- so a FUTURE
+                # --resume run correctly recognizes these as done.
                 for fasta in files_to_run:
-                    queue_ready_fasta_for_append(fasta)
+                    n = total_appended_by_fasta.get(fasta, 0)
+                    out_fasta = fasta_info[fasta]["out_fasta"]
+                    with append_state_lock:
+                        if n == 0:
+                            fasta_logs[fasta].append(f"No BLAST hits found in {fasta}")
+                        fasta_logs[fasta].append(f"Appended {n} sequence(s) to {out_fasta}")
+                    write_one_fasta_log(fasta)
+                    log_console(f'Finished "{fasta}": appended {n} sequence(s)')
 
             elif len(db_list) == 1:
                 single_db = db_list[0]
@@ -1235,19 +1453,28 @@ def run_blast_species(args: argparse.Namespace) -> None:
                         update_blast_progress(force=True)
                         queue_ready_fasta_for_append(fasta_name)
 
-            for fasta in files_to_run:
-                queue_ready_fasta_for_append(fasta)
+            if not is_batch_query_mode:
+                # Per-file mode only: queue_ready_fasta_for_append/append_queue/
+                # append_threads are the per-file append mechanism, drained here.
+                # Batch mode has its own separate append queue+workers, already
+                # fully drained and joined inside the batch branch above --
+                # redundantly touching queued_for_append/appended_files here
+                # would just add fastas to queued_for_append with nothing ever
+                # marking them in appended_files (since no append_worker runs
+                # in batch mode), hanging this wait loop forever.
+                for fasta in files_to_run:
+                    queue_ready_fasta_for_append(fasta)
 
-            while True:
-                with append_state_lock:
-                    done_appending = len(appended_files)
-                    queued_count = len(queued_for_append)
+                while True:
+                    with append_state_lock:
+                        done_appending = len(appended_files)
+                        queued_count = len(queued_for_append)
 
-                if done_appending >= queued_count:
-                    break
+                    if done_appending >= queued_count:
+                        break
 
-                update_blast_progress(force=True)
-                time.sleep(0.2)
+                    update_blast_progress(force=True)
+                    time.sleep(0.2)
 
             update_blast_progress(force=True)
             status = None
