@@ -135,12 +135,26 @@ def run_blast_species(args: argparse.Namespace) -> None:
     import threading
     import subprocess
     import queue
+    import collections
+    import shutil
     from pathlib import Path
     from datetime import datetime
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from typing import Dict, List, Set
 
     run_start = time.time()
+
+    # Rolling window for ETA rate estimation. A pure cumulative average
+    # (total_jobs_done / elapsed_since_start) gets permanently skewed by
+    # whatever happened early in a long run (thread-pool warm-up, cold disk
+    # cache, an unusually slow first DB) -- and for a job with hundreds of
+    # thousands of units, "early" can be the first many minutes, during
+    # which the cumulative average barely moves even once steady-state
+    # throughput is much faster. A trailing window recovers from that within
+    # RATE_WINDOW_SECONDS instead of dragging the skew for the whole run.
+    RATE_WINDOW_SECONDS = 45.0
+    rate_samples: "collections.deque[tuple[float, int]]" = collections.deque()
+    rate_samples_lock = threading.Lock()
 
     def now_stamp() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -154,8 +168,27 @@ def run_blast_species(args: argparse.Namespace) -> None:
     def estimate_eta(done: int, total: int) -> tuple[str, float]:
         if done <= 0:
             return "estimating...", 0.0
-        elapsed = max(time.time() - run_start, 1e-9)
-        rate = done / elapsed
+
+        now = time.time()
+        with rate_samples_lock:
+            rate_samples.append((now, done))
+            cutoff = now - RATE_WINDOW_SECONDS
+            while len(rate_samples) > 1 and rate_samples[0][0] < cutoff:
+                rate_samples.popleft()
+            oldest_t, oldest_done = rate_samples[0]
+
+        span = now - oldest_t
+        done_delta = done - oldest_done
+        windowed_rate = (done_delta / span) if (span >= 3.0 and done_delta > 0) else None
+
+        elapsed = max(now - run_start, 1e-9)
+        cumulative_rate = done / elapsed
+
+        # Use the windowed rate once we actually have a few seconds of
+        # recent history to compute it from; otherwise (very start of the
+        # run) fall back to the cumulative average, which is all we have.
+        rate = windowed_rate if windowed_rate is not None else cumulative_rate
+
         remaining = max(total - done, 0)
         eta_seconds = remaining / rate if rate > 0 else 0.0
         return fmt_elapsed(eta_seconds), rate
@@ -366,58 +399,181 @@ def run_blast_species(args: argparse.Namespace) -> None:
     def full_bp(fasta_text: str) -> int:
         return sum(len(x.strip()) for x in fasta_text.splitlines() if x and not x.startswith(">"))
 
+    def parse_tsv_row(parts: List[str], prog_name: str):
+        """Parse one BLAST tabular-output row (already split into fields,
+        WITHOUT any qseqid column) into (taxid, score, payload), or None if
+        the row is short/unparseable. Shared by both per-file mode
+        (parse_best_hit_from_tsv) and batch-query mode
+        (parse_best_hits_grouped_by_qseqid), so the two modes can never
+        silently diverge in how a hit is interpreted."""
+        if len(parts) < 3:
+            return None
+
+        raw_id = parts[0]
+        sseqid = normalize_id(raw_id)
+        taxids = parts[1]
+        score_str = parts[2]
+        taxid = (taxids.split(";", 1)[0] if taxids else "NA")
+        if taxid in ("0", "NA", ""):
+            taxid = sseqid
+
+        try:
+            score = float(score_str)
+        except ValueError:
+            return None
+
+        if prog_name == "tblastn":
+            if len(parts) < 7:
+                return None
+            try:
+                sstart = int(parts[3])
+                send = int(parts[4])
+                sframe = int(parts[5])
+            except ValueError:
+                return None
+            sseq = parts[6]
+            payload = (sseqid, score, sstart, send, sframe, sseq)
+
+        elif prog_name == "blastn":
+            if len(parts) < 6:
+                return None
+            try:
+                sstart = int(parts[3])
+                send = int(parts[4])
+            except ValueError:
+                return None
+            sstrand = parts[5]
+            payload = (sseqid, score, sstart, send, sstrand)
+
+        else:
+            payload = (sseqid, score)
+
+        return taxid, score, payload
+
     def parse_best_hit_from_tsv(per_db_res: str, prog_name: str):
         best_for_db = None
 
         with open(per_db_res) as br:
             for line in br:
                 parts = line.rstrip("\n").split("\t") if "\t" in line else line.strip().split()
-                if len(parts) < 3:
+                parsed = parse_tsv_row(parts, prog_name)
+                if parsed is None:
                     continue
-
-                raw_id = parts[0]
-                sseqid = normalize_id(raw_id)
-                taxids = parts[1]
-                score_str = parts[2]
-                taxid = (taxids.split(";", 1)[0] if taxids else "NA")
-                if taxid in ("0", "NA", ""):
-                    taxid = sseqid
-
-                try:
-                    score = float(score_str)
-                except ValueError:
-                    continue
-
-                if prog_name == "tblastn":
-                    if len(parts) < 7:
-                        continue
-                    try:
-                        sstart = int(parts[3])
-                        send = int(parts[4])
-                        sframe = int(parts[5])
-                    except ValueError:
-                        continue
-                    sseq = parts[6]
-                    payload = (sseqid, score, sstart, send, sframe, sseq)
-
-                elif prog_name == "blastn":
-                    if len(parts) < 6:
-                        continue
-                    try:
-                        sstart = int(parts[3])
-                        send = int(parts[4])
-                    except ValueError:
-                        continue
-                    sstrand = parts[5]
-                    payload = (sseqid, score, sstart, send, sstrand)
-
-                else:
-                    payload = (sseqid, score)
-
+                taxid, score, payload = parsed
                 if best_for_db is None or score > best_for_db[1][1]:
                     best_for_db = (taxid, payload)
 
         return best_for_db
+
+    def parse_best_hits_grouped_by_qseqid(per_db_res: str, prog_name: str) -> Dict[str, tuple]:
+        """Batch-query-mode variant: the TSV has an EXTRA trailing qseqid
+        column (appended, so all the existing fixed-position field indices
+        parse_tsv_row relies on stay valid). Returns the best (taxid,
+        payload) per qseqid, exactly like parse_best_hit_from_tsv does per
+        whole file in per-file mode -- just grouped, since one combined file
+        now covers every query at once."""
+        best_by_qseqid: Dict[str, tuple] = {}
+
+        with open(per_db_res) as br:
+            for line in br:
+                parts = line.rstrip("\n").split("\t") if "\t" in line else line.strip().split()
+                if len(parts) < 2:
+                    continue
+                qseqid = parts[-1]
+                parsed = parse_tsv_row(parts[:-1], prog_name)
+                if parsed is None:
+                    continue
+                taxid, score, payload = parsed
+                cur = best_by_qseqid.get(qseqid)
+                if cur is None or score > cur[2]:
+                    best_by_qseqid[qseqid] = (taxid, payload, score)
+
+        return {q: (t, p) for q, (t, p, _score) in best_by_qseqid.items()}
+
+    def build_combined_query_fasta(files: List[str], out_path) -> Dict[str, str]:
+        """Concatenate every query FASTA in `files` into one combined
+        multi-FASTA for batch-query mode, rewriting each sequence's header to
+        a globally unique id (filenames are already unique within one
+        directory listing, so `<stem>__<i>` cannot collide). Returns
+        {qseqid: original_fasta_path} so results can be attributed back to
+        the file they came from without re-parsing anything."""
+        qseqid_to_fasta: Dict[str, str] = {}
+        with open(out_path, "w") as out_h:
+            for fasta in files:
+                stem = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(fasta).stem)
+                seq_idx = 0
+                writing = False
+                with open(fasta) as in_h:
+                    for line in in_h:
+                        line = line.rstrip("\n")
+                        if line.startswith(">"):
+                            qseqid = f"{stem}__{seq_idx}"
+                            seq_idx += 1
+                            qseqid_to_fasta[qseqid] = fasta
+                            out_h.write(f">{qseqid}\n")
+                            writing = True
+                        elif writing:
+                            out_h.write(line + "\n")
+        return qseqid_to_fasta
+
+    def search_one_db_batch(
+        hit_db: str,
+        combined_query: str,
+        blast_prog: str,
+        blast_threads: int,
+        outfmt_batch: str,
+        extra_args: list[str],
+    ):
+        """Batch-query-mode search: ONE blast process for this DB, searching
+        every query at once, instead of one process per (fasta, db) pair.
+        This is the whole point of batch mode -- eliminating the repeated
+        per-query DB-load/setup overhead that dominates when each query gets
+        its own tiny process."""
+        worker_logs: List[str] = []
+
+        with tempfile.NamedTemporaryFile(mode="w+", suffix=".tsv", delete=False) as tmp:
+            per_db_res = tmp.name
+
+        cmd = [
+            blast_prog,
+            "-query", combined_query,
+            "-db", hit_db,
+            "-num_threads", str(blast_threads),
+            "-max_target_seqs", "50",
+            "-max_hsps", "1",
+            "-outfmt", outfmt_batch,
+            "-out", per_db_res,
+        ]
+        if extra_args:
+            cmd.extend(extra_args)
+
+        try:
+            subprocess.run(cmd, check=True)
+        except FileNotFoundError:
+            try:
+                os.remove(per_db_res)
+            except OSError:
+                pass
+            raise RuntimeError(f"Error: '{blast_prog}' not found on PATH. Install BLAST+ and try again.")
+        except subprocess.CalledProcessError as e:
+            worker_logs.append(f"BLAST failed for db={db_label(hit_db)} (batch query): {e}")
+            try:
+                os.remove(per_db_res)
+            except OSError:
+                pass
+            return hit_db, None, worker_logs
+
+        try:
+            best_by_qseqid = parse_best_hits_grouped_by_qseqid(
+                per_db_res, os.path.basename(blast_prog).lower()
+            )
+        finally:
+            try:
+                os.remove(per_db_res)
+            except OSError:
+                pass
+
+        return hit_db, best_by_qseqid, worker_logs
 
     def search_one_fasta_db(
         fasta: str,
@@ -849,12 +1005,28 @@ def run_blast_species(args: argparse.Namespace) -> None:
             finally:
                 append_queue.task_done()
 
-    append_thread = threading.Thread(
-        target=append_worker,
-        name="blast-species-append-worker",
-        daemon=True,
-    )
-    append_thread.start()
+    # append_one_finished_fasta is safe to run concurrently across DIFFERENT
+    # fasta files: each writes to its own out_fasta/log_file, and all shared
+    # state it touches (fasta_logs, appended_files, queued_for_append,
+    # append_errors, species_name_cache) is already protected by locks. A
+    # single append worker becomes a bottleneck once the search phase is
+    # well-parallelized (e.g. --jobs 64): every appended hit does at least
+    # one blastdbcmd subprocess call (a range/full fetch, plus a cached
+    # taxid->species lookup), and funneling that through one thread can leave
+    # most cores idle once the search phase races ahead of a single-threaded
+    # append queue. --append-workers lets that stage scale independently.
+    n_append_workers = max(1, int(getattr(args, "append_workers", 8)))
+
+    append_threads = [
+        threading.Thread(
+            target=append_worker,
+            name=f"blast-species-append-worker-{i}",
+            daemon=True,
+        )
+        for i in range(n_append_workers)
+    ]
+    for t in append_threads:
+        t.start()
 
     try:
         with TickingStatus(
@@ -866,7 +1038,104 @@ def run_blast_species(args: argparse.Namespace) -> None:
         ) as ticking_status:
             status = ticking_status
 
-            if len(db_list) == 1:
+            if getattr(args, "query_mode", "per-file") == "batch":
+                batch_work_dir = tempfile.mkdtemp(prefix="forge_batch_query_")
+                combined_query_path = os.path.join(batch_work_dir, "combined_queries.fasta")
+
+                log_console(
+                    f"[DEBUG] batch-query mode: combining {len(files_to_run)} "
+                    f"query file(s) into one multi-FASTA for {len(db_list)} db job(s)"
+                )
+                qseqid_to_fasta = build_combined_query_fasta(files_to_run, combined_query_path)
+
+                outfmt_batch = outfmt + " qseqid"
+
+                if args.jobs is None:
+                    max_workers = max(1, min(len(db_list), os.cpu_count() or 1))
+                else:
+                    max_workers = max(1, int(args.jobs))
+
+                log_console(
+                    f"[DEBUG] batch-query mode: scheduling {len(db_list)} db job(s) "
+                    f"with max_workers={max_workers}, db_threads={multi_db_threads}"
+                )
+
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    futures = {
+                        ex.submit(
+                            search_one_db_batch,
+                            db,
+                            combined_query_path,
+                            args.tl,
+                            multi_db_threads,
+                            outfmt_batch,
+                            args.extra,
+                        ): db
+                        for db in db_list
+                    }
+
+                    # Batch mode has no meaningful per-file granularity until
+                    # a DB's single combined search returns, so mark every
+                    # file "active" against every DB up front.
+                    with state_lock:
+                        for fasta in files_to_run:
+                            active_db_counts[fasta] += len(db_list)
+                    update_blast_progress(force=True)
+
+                    for fut in as_completed(futures):
+                        hit_db = futures[fut]
+                        try:
+                            _, best_by_qseqid, worker_logs = fut.result()
+                        except Exception as e:
+                            log_console(f"Batch search failed for db={db_label(hit_db)}: {e}")
+                            with state_lock:
+                                for fasta in files_to_run:
+                                    active_db_counts[fasta] -= 1
+                                    completed_jobs_by_fasta[fasta] += 1
+                                    total_jobs_done += 1
+                            update_blast_progress(force=True)
+                            continue
+
+                        # Reduce per-qseqid hits down to per-fasta: a file may
+                        # contribute more than one query sequence, so keep the
+                        # single best -- this matches per-file mode's
+                        # semantics of "best hit across all of this file's
+                        # queries against this db" exactly.
+                        best_by_fasta_for_this_db: Dict[str, tuple] = {}
+                        if best_by_qseqid:
+                            for qseqid, (taxid, payload) in best_by_qseqid.items():
+                                owning_fasta = qseqid_to_fasta.get(qseqid)
+                                if owning_fasta is None:
+                                    continue
+                                score = payload[1]
+                                cur = best_by_fasta_for_this_db.get(owning_fasta)
+                                if cur is None or score > cur[1][1]:
+                                    best_by_fasta_for_this_db[owning_fasta] = (taxid, payload)
+
+                        with append_state_lock:
+                            for fasta in files_to_run:
+                                fasta_logs[fasta].extend(worker_logs)
+
+                        with state_lock:
+                            for fasta in files_to_run:
+                                active_db_counts[fasta] -= 1
+                                completed_jobs_by_fasta[fasta] += 1
+                                total_jobs_done += 1
+
+                        for fasta, (taxid, payload) in best_by_fasta_for_this_db.items():
+                            best_hits_by_fasta[fasta][hit_db] = (hit_db, taxid, payload)
+
+                        update_blast_progress(force=True)
+
+                shutil.rmtree(batch_work_dir, ignore_errors=True)
+
+                # Every file becomes "ready" for append at the same moment in
+                # batch mode: completed_jobs_by_fasta only reaches len(db_list)
+                # for ALL files simultaneously, once the last DB job returns.
+                for fasta in files_to_run:
+                    queue_ready_fasta_for_append(fasta)
+
+            elif len(db_list) == 1:
                 single_db = db_list[0]
                 blast_threads = args.t
 
@@ -984,8 +1253,10 @@ def run_blast_species(args: argparse.Namespace) -> None:
             status = None
 
     finally:
-        append_queue.put(None)
-        append_thread.join()
+        for _ in append_threads:
+            append_queue.put(None)
+        for t in append_threads:
+            t.join()
 
     if append_errors:
         log_console(f"Warning: {len(append_errors)} file(s) had append-thread errors.")
@@ -1032,6 +1303,25 @@ def register(sub, formatter_class) -> None:
         help="BLAST database prefix, alias prefix, or directory containing many DBs"
     )
     sp_blast.add_argument("-tl", metavar="PROGRAM", default="blastn", help="BLAST+ program (blastn, blastp, tblastn)")
+    sp_blast.add_argument(
+        "--query-mode",
+        choices=["per-file", "batch"],
+        default="per-file",
+        help=("'per-file' (default): one BLAST process per (query, DB) pair "
+              "-- simple, but for many queries against few DBs, most of the "
+              "time goes to repeated per-query DB-load/setup overhead. "
+              "'batch': combine ALL query files into one multi-FASTA and run "
+              "just ONE BLAST process per DB, searching every query at once. "
+              "Much less process/DB-load overhead for large query counts "
+              "against a handful of DBs (the common case for this tool), at "
+              "the cost of not seeing per-file completion until every DB "
+              "has finished (results are only attributed back to individual "
+              "files after each DB's single combined search returns). "
+              "In batch mode, --jobs means concurrent DB searches (not "
+              "concurrent query-DB pairs), and --db-threads means threads "
+              "for that one big per-DB search (so it can usefully be much "
+              "higher than in per-file mode).")
+    )
     sp_blast.add_argument("-t", metavar="THREADS", type=int, default=1, help="Threads")
     sp_blast.add_argument(
         "--jobs",
@@ -1047,6 +1337,18 @@ def register(sub, formatter_class) -> None:
         default=1,
         help=("Threads per BLAST process in multi-DB mode. "
               "Single-DB mode still uses -t.")
+    )
+    sp_blast.add_argument(
+        "--append-workers",
+        type=int,
+        default=8,
+        help=("Concurrent workers for the post-search append step (fetching "
+              "hit sequences and resolving species names via blastdbcmd). "
+              "This runs independently of --jobs/--db-threads, which only "
+              "control the BLAST search itself. Increase this if CPU "
+              "utilization during a run stays low despite a high --jobs "
+              "value -- a single-threaded append stage can bottleneck an "
+              "otherwise well-parallelized search phase. Default: 8.")
     )
     sp_blast.add_argument("--extra", nargs=argparse.REMAINDER, default=[], help="Pass extra BLAST flags after --")
     sp_blast.add_argument(
