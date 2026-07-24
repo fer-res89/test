@@ -24,7 +24,7 @@ import argparse
 import sys
 
 try:
-    from . import filter_pipeline, clean_labels, dedupe, blast_species, taxid
+    from . import filter_pipeline, clean_labels, dedupe, blast_species, miniprot_recover, taxid
 except ModuleNotFoundError as e:
     sys.exit(
         f"forge is missing a required dependency ({e.name}).\n"
@@ -37,6 +37,7 @@ SUBCOMMAND_MODULES = (
     clean_labels,
     dedupe,
     blast_species,
+    miniprot_recover,
     taxid,
 )
 
