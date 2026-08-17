@@ -3,10 +3,10 @@
 Two independent command-line tools, developed together and sharing a small
 internal library, for taking OrthoFinder output through to dated gene trees:
 
-- **`forge`** — maximizes the amount of orthogroups recovered through
+- **`FORGE (Framework for Orthogroup Refinement and Gene-tree Evaluation)`** — maximizes the amount of orthogroups recovered through
   OrthoFinder and curates the data for downstream analysis (QC, label
   cleaning, deduplication, BLAST-based taxon augmentation, taxid mapping).
-- **`aeon`** — runs **MCMCTree** (and CodeML) at scale, with helpers for
+- **`AEON (Automated Estimation Of Node-ages)`** — runs **MCMCTree** (and CodeML) at scale, with helpers for
   quartet-based gene tree bucketing, triplet tree rearrangement, Newick
   sanitization, and automated extraction of divergence-time HPDs.
 
