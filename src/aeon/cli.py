@@ -224,7 +224,9 @@ def main() -> None:
     if getattr(args, "per_dir", False):
         run_per_dir(args)
     else:
-        args.func(args)
+        rc = args.func(args)
+        if rc is False:          # subcommands that report failure (process, pipe-all, run-dirs)
+            sys.exit(1)
 
 
 if __name__ == "__main__":

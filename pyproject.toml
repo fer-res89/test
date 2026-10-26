@@ -21,6 +21,7 @@ forge = [
     "rich>=13.0",
 ]
 aeon = [
+    "biopython>=1.80",
     "dendropy>=4.6",
     "ete3>=3.1",
 ]

@@ -227,19 +227,24 @@ Parse GPFF/GenBank files and emit a TSV mapping seqid → taxid.
 ---
 
 ### `aeon process`
-Run MCMCTree + CodeML on one FASTA with one species tree.
+Run MCMCTree + CodeML on one FASTA with one tree.
 
 ```bash
-aeon process OG0001.fa species_tree.tre \
-  --ctl-template my_template.ctl \
-  --wag-file my_wag.dat
+aeon process OG0001.fa OG0001.tre --root-cal "B(2.60,2.90,0.025,0.025)"
 ```
 
-- If `--ctl-template` is omitted, an embedded template is used. `seqfile=` and `treefile=` are injected automatically.
-- If `--wag-file` is omitted, an embedded WAG matrix is written as `wag.dat` and used by CodeML.
-- The tree can also be supplied via `--tree-dir`/`--tree-ext` instead of positionally, matched by FASTA basename.
-- Pipeline: MCMCTree → patch `tmp0001.ctl` for CodeML → CodeML → write `in.BV` → final MCMCTree. Outputs are renamed alongside the FASTA (e.g., `OG0001.mcmc.txt`, `OG0001.out.txt`, `OG0001.FigTree.tre`, `OG0001.in.BV`).
-- If a preliminary run fails but expected intermediates exist, the pipeline continues (with warnings).
+- If `--ctl-template` is omitted, an embedded template is used (independent rates, `burnin = 20000`, **no `RootAge`**). `seqfile`, `treefile`, `mcmcfile = mcmc.txt`, `outfile = out.txt` and `usedata` are always set by aeon.
+- If `--wag-file` is omitted, the embedded WAG matrix is used. Any PAML amino-acid matrix can be passed instead (it is copied as `wag.dat`).
+- The tree can also be supplied via `--tree-dir`/`--tree-ext`, matched by FASTA basename. A missing `<ntaxa> 1` header is added automatically.
+- Pipeline: MCMCTree (`usedata = 3`) → patch `tmp0001.ctl` for CodeML → CodeML → `in.BV` → MCMCTree (`usedata = 2`).
+- **Every gene runs in its own scratch directory** (`_aeon_work_<stem>`), so genes sharing a directory never overwrite each other's `tmp0001.*`, `rst2`, `in.BV`, `mcmc.txt`, `FigTree.tre`. Only the outputs are moved next to the FASTA (or to `--out-dir`): `<stem>.FigTree.tre`, `<stem>.mcmc.txt`, `<stem>.out.txt`, `<stem>.ctl` (the control file actually used), `<stem>.in.BV`. A failed run keeps its scratch directory for debugging and the command exits non-zero.
+
+**Root age and calibrations.** MCMCTree needs either a calibration on the root or `RootAge` in the control file.
+- `--root-cal "B(lower,upper,pL,pU)"` writes the calibration on the root of the tree (time units, usually 100 Myr), strips branch lengths and support values, keeps other quoted calibrations, and removes `RootAge` from the control file.
+- `--root-age "VALUE"` sets `RootAge` (e.g. `'<3.0'`, `'>2.6<2.9'`); `--root-age none` removes it from a custom template.
+- aeon warns before running if neither is present.
+
+**Other run options** (also on `pipe-all` and `run-dirs`): `--prior-only` (`usedata = 0`, no CodeML; outputs named `<stem>.prior.*` unless `--out-dir` is given), `--out-dir`, `--burnin`, `--sampfreq`, `--nsample`, `--seed` (e.g. a second chain), `--keep-work`.
 
 ---
 
@@ -247,13 +252,13 @@ aeon process OG0001.fa species_tree.tre \
 Run the same analysis for every `*.fa` (or `-e` extension) in the current directory:
 
 ```bash
-aeon pipe-all species_tree.tre -e .fa --resume \
-  --ctl-template my_template.ctl \
-  --wag-file my_wag.dat
+aeon pipe-all -e .fa --tree-dir trees --tree-ext .tre --resume -j 60 \
+  --root-cal "B(2.60,2.90,0.025,0.025)"
 ```
 
-- `--resume` skips FASTAs that already produced `<name>.FigTree.tre`.
-- Same template, WAG, and `--tree-dir` override behavior as `process`.
+- `-j/--jobs N` runs N genes in parallel (safe: each gene has its own scratch directory).
+- `--resume` skips FASTAs whose `FigTree.tre` output already exists (for the chosen mode/`--out-dir`).
+- Same options as `process`.
 
 ---
 
@@ -261,9 +266,7 @@ aeon pipe-all species_tree.tre -e .fa --resume \
 Process each subdirectory of the current working directory.
 
 ```bash
-aeon run-dirs -e .fa --resume \
-  --ctl-template my_template.ctl \
-  --wag-file my_wag.dat
+aeon run-dirs -e .fa --resume -j 60 --root-cal "B(2.60,2.90,0.025,0.025)"
 ```
 
 **How trees are selected & copied**
@@ -294,7 +297,7 @@ aeon extract-dates --target-tips TaxonA,TaxonB -e .tre
 # writes: dates_<cwd>.csv (or dates_int_/dates_ext_ with -in/-ex)
 ```
 
-Parses NEXUS trees, finds the common ancestor of the provided tips, and reads the `&95%HPD={lo,hi}` comment. The CSV has columns: `base, lo, hi, avg`.
+Parses NEXUS trees, finds the common ancestor of the provided tips, and reads the `&95%HPD={lo,hi}` comment. The CSV has columns: `base, lo, hi, centre`. By default `centre` is the **midpoint of the HPD** (the historical behaviour), which is not a posterior estimate because node-age HPDs are usually asymmetric; `--center mean` writes the posterior-mean age instead (from the FigTree.tre branch lengths) and is recommended for new analyses.
 
 Instead of fixed `--target-tips`, you can drive this from a quartets TSV
 (same format as `bucket-files`) with `-qt`/`--quartets-tsv` plus

@@ -11,6 +11,8 @@ from pathlib import Path
 
 from Bio import Phylo
 
+from .bucketing import _qb_bucket_dir_map, _qb_load_quartets
+
 def _ed_load_quartets_tsv(tsv_path: str) -> dict[str, dict[str, set[str]]]:
     """
     Load quartets.tsv into a dict: name -> { "A": set(...), "B": set(...), "C": set(...), "D": set(...) }.
@@ -218,7 +220,18 @@ def _ed_build_pair_in_ext_from_quartet(qrec: dict, which: str):
 # =========================
 
 
-def _get_ages(tree_file, target_tips):
+_CENTER = "midpoint"   # set from --center in cmd_extract_dates
+
+
+def _get_ages(tree_file, target_tips, center: str | None = None):
+    """(HPD low, HPD high, centre) for the MRCA of target_tips.
+
+    centre = 'midpoint': (low + high) / 2, the historical behaviour (NOT a
+             posterior estimate; HPDs of node ages are usually asymmetric).
+    centre = 'mean':     posterior-mean age, read from the FigTree.tre branch
+             lengths (MCMCTree writes posterior-mean times as branch lengths).
+    """
+    center = center or _CENTER
     try:
         tree = Phylo.read(tree_file, 'nexus')
     except ValueError:
@@ -230,6 +243,10 @@ def _get_ages(tree_file, target_tips):
     if len(parts) != 2:
         return None
     lo, hi = map(float, parts[1].strip('{}').split(','))
+    if center == "mean":
+        tips = mrca.get_terminals()
+        age = max(tree.distance(mrca, t) for t in tips)
+        return lo, hi, age
     return lo, hi, (lo + hi) / 2
 
 def cmd_extract_dates(args):
@@ -254,6 +271,9 @@ def cmd_extract_dates(args):
             dates_int_<name>.csv
             dates_ext_<name>.csv
     """
+
+    global _CENTER
+    _CENTER = getattr(args, "center", "midpoint")
 
     # ---- Enforce target-tips requirement only when needed ----
     if not getattr(args, "quartets_tsv", None):
@@ -378,16 +398,7 @@ def cmd_extract_dates(args):
             continue
 
         # Build topology→dirname mapping consistent with bucket-files
-        if "_qb_bucket_dir_map" in globals():
-            dir_map = _qb_bucket_dir_map(qrec, getattr(args, "focal", None))
-        else:
-            dir_map = {
-                "AB|CD": "AB_CD",
-                "AC|BD": "AC_BD",
-                "AD|BC": "AD_BC",
-                "unresolved": "unresolved",
-                "insufficient": "insufficient",
-            }
+        dir_map = _qb_bucket_dir_map(qrec, getattr(args, "focal", None))
 
 
         print(f"[DEBUG] Processing quartet: {qname}", file=sys.stderr)
@@ -481,6 +492,11 @@ def register(sub) -> None:
         help="Batch mode: starting from CWD, look for directories whose name matches a "
              "quartet 'name' in --quartets-tsv, and inside each such directory process "
              "its immediate subdirectories as data dirs."
+    )
+    p4.add_argument(
+        "--center", choices=["midpoint", "mean"], default="midpoint",
+        help="Value written in the 4th column: 'midpoint' of the 95%% HPD (historical default) "
+             "or the posterior 'mean' age from the FigTree.tre branch lengths (recommended)."
     )
     p4.set_defaults(func=cmd_extract_dates)
 

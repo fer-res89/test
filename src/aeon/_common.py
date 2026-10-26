@@ -19,7 +19,8 @@ DUMMY_CTL_EMBED = '''          seed = -1
        seqtype = 2  * 0: nucleotides; 1:codons; 2:AAs
        usedata = 3    * 0: no data; 1:seq like; 2:use in.BV; 3: out.BV
          clock = 2    * 1: global clock; 2: independent rates; 3: correlated rates
-       RootAge = '>3.16<3.224'
+* RootAge is intentionally absent: calibrate the root on the tree (aeon --root-cal)
+* or set it per run with aeon --root-age. MCMCTree stops if the root has neither.
 
          model = 0    * 0:JC69, 1:K80, 2:F81, 3:F84, 4:HKY85
          alpha = 0    * alpha for gamma rates at sites
@@ -37,7 +38,7 @@ DUMMY_CTL_EMBED = '''          seed = -1
       finetune = 1: 0.1  0.1  0.1  0.1  0.1  0.1  * auto (0 or 1) : times, musigma2, rates, mixing, paras, FossilErr
 
          print = 1
-        burnin = 2000
+        burnin = 20000
       sampfreq = 10
        nsample = 20000
 '''
@@ -75,10 +76,42 @@ def run_cmd(cmd, cwd=None):
     print(f"Running: {msg}")
     subprocess.run(cmd, cwd=cwd, check=True)
 
-def generate_ctl(template_text: str, seqfile: str, treefile: str, dest_path: Path):
-    txt = re.sub(r'(?m)^(\s*seqfile\s*=).*$', rf"\1 {seqfile}", template_text)
-    txt = re.sub(r'(?m)^(\s*treefile\s*=).*$', rf"\1 {treefile}", txt)
+def ctl_get(txt: str, key: str) -> str | None:
+    """Value of `key = value` in a PAML control file (inline * comments removed)."""
+    m = re.search(rf'(?m)^\s*{key}\s*=\s*([^*\n]*)', txt)
+    return m.group(1).strip() if m else None
+
+
+def ctl_set(txt: str, key: str, value: str | None) -> str:
+    """Set `key = value` in a PAML control file; value None removes the line.
+    Missing keys are appended."""
+    pat = rf'(?m)^[ \t]*{key}[ \t]*=.*\n?'
+    if value is None:
+        return re.sub(pat, '', txt)
+    line = f"{key:>14s} = {value}\n"
+    if re.search(pat, txt):
+        return re.sub(pat, lambda _m: line, txt, count=1)
+    return txt.rstrip('\n') + '\n' + line
+
+
+def format_root_age(value: str) -> str:
+    """Quote a RootAge value the way MCMCTree expects, e.g. <3.0 -> '<3.0'."""
+    v = value.strip()
+    if not (v.startswith("'") and v.endswith("'")):
+        v = f"'{v.strip(chr(39))}'"
+    return v
+
+
+def generate_ctl(template_text: str, seqfile: str, treefile: str, dest_path: Path,
+                 overrides: dict | None = None):
+    """Write a control file from the template with seqfile/treefile set and any
+    overrides applied ({key: value}; value None removes the key)."""
+    txt = ctl_set(template_text, 'seqfile', seqfile)
+    txt = ctl_set(txt, 'treefile', treefile)
+    for k, v in (overrides or {}).items():
+        txt = ctl_set(txt, k, v)
     dest_path.write_text(txt)
+    return txt
 
 
 def _write_wag(dest_dir: Path, wag_file: str | None):
