@@ -311,6 +311,41 @@ data directories.
 
 ---
 
+### `aeon ils-*`: gene-tree dating test of ILS
+Downstream analysis of per-gene MCMCTree runs (data and, optionally, prior-only) against an ASTRAL species tree with branch lengths in coalescent units. Gallus-rooted gene trees; branch-specific rooted triplets classified as concordant (C) or discordant (D1, D2) per species-tree branch.
+
+```bash
+# 1. ages of every triplet node, per gene x branch x class (+ QC / ESS)
+aeon ils-extract --species-tree astral_T1.tre --data-dir dating --prior-dir dating \
+    --polytomy dibamus_groups.tsv --polytomy-T 0.016 --clade-names clade_names.tsv \
+    --threads 60 --out-dir ext_T1                      # add --allow-no-prior without prior runs
+
+# 2. (optional) second-chain check on a subset
+aeon ils-convergence --run1 dating --run2 dating_rep --out-dir conv
+
+# 3. statistics, tables and plots
+aeon ils-analyze --ext-dir ext_T1 --out-dir res_T1 --bootstrap 2000 \
+    --exclude-genes conv/convergence_fail.txt --tau-tree bpp=bpp_T1.tre@root=2.8
+Rscript res_T1/plot_branch_distributions.R res_T1      # optional ggplot2 version of the plots
+```
+
+- `ils-extract` verifies MCMCTree node numbering for every gene (mcmc.txt column means vs FigTree.tre), and finds aeon's `<stem>.prior.*` prior-only outputs automatically.
+- `ils-analyze` writes gene-weighted class means and contrasts with gene-bootstrap CIs (`branch_contrasts.tsv`), ASTRAL check, absolute test, implied 2Nₑg, cross-branch regression, and:
+  - `dates_long.tsv.gz`: tidy gene-tree dates, one row per gene × branch × class × run (`t_in_Ma`, `t_out_Ma`, `r`, gene weight `w`), ready for R;
+  - `branch_tau.tsv`: species-tree τ per branch for reference lines;
+  - `branch_distributions.pdf` and `branch_distributions/<branch>.png`: per-branch histograms of t_in, t_out and r by class (data filled, prior dashed).
+- `ils-simulate` writes MSC gene trees as fake MCMCTree output for validating the statistics and for power/bias checks (posterior noise, shrinkage toward the prior, missing taxa). With `--sequences` it instead evolves amino-acid alignments (WAG + Γ4, independent lognormal branch rates, per-gene rate variation) along the MSC gene trees and writes `seqs/`, true topologies in `trees/`, true ages in `truth/` and a suggested `root_calibration.txt`: date `seqs/` with `aeon pipe-all`, then run `ils-extract`/`ils-analyze` on both the MCMCTree output and `truth/` to see what dating does to the MSC signal.
+
+R quick look:
+```r
+d <- read.delim(gzfile("res_T1/dates_long.tsv.gz"))
+library(ggplot2)
+ggplot(subset(d, run == "data"), aes(t_out_Ma, weight = w, fill = cls)) +
+  geom_histogram(bins = 40, alpha = .4, position = "identity") + facet_wrap(~ branch_label, scales = "free")
+```
+
+---
+
 ### `aeon bucket-files`
 Bucket gene trees by which pair of groups forms a clade (G1+G2, G1+G3, G2+G3), and copy matching sequence or tree files.
 

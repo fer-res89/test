@@ -8,12 +8,16 @@ aeon — one-stop CLI for:
   • extract-dates       Extract 95% HPD ages from NEXUS .tre files
   • rearrange-triplet   Produce (g1,g3)|g2 and (g2,g3)|g1 Newicks preserving original root split/order
   • sanitize-tree       Sanitize a Newick file (collapse unary, drop numeric internal labels, etc.)
+  • ils-extract         Triplet node ages from dated gene trees (gene-tree dating ILS test)
+  • ils-convergence     Compare two MCMCTree chains per gene
+  • ils-analyze         Gene-weighted statistics, bootstrap, tables, per-branch date distributions
+  • ils-simulate        MSC gene trees written as MCMCTree output (validation / power)
 
 Any subcommand can be run once per subdirectory with the global --per-dir
 flag (see `aeon --help`).
 
 Dependencies:
-  - dendropy, Biopython (Bio.Phylo), ete3
+  - dendropy, Biopython (Bio.Phylo), ete3; numpy, pandas, scipy, matplotlib (ils-*)
   - External tools in $PATH: mcmctree, codeml
 
 Adding a new subcommand: create a new module in this package exposing a
@@ -30,6 +34,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 try:
     from . import bucketing, process, extract_dates, rearrange_triplet, sanitize_tree
+    from . import ils_extract, ils_convergence, ils_analyze, ils_simulate
 except ModuleNotFoundError as e:
     sys.exit(
         f"aeon is missing a required dependency ({e.name}).\n"
@@ -43,6 +48,10 @@ SUBCOMMAND_MODULES = (
     extract_dates,
     rearrange_triplet,
     sanitize_tree,
+    ils_extract,
+    ils_convergence,
+    ils_analyze,
+    ils_simulate,
 )
 
 
