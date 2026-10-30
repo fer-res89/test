@@ -12,6 +12,7 @@ aeon — one-stop CLI for:
   • ils-convergence     Compare two MCMCTree chains per gene
   • ils-analyze         Gene-weighted statistics, bootstrap, tables, per-branch date distributions
   • ils-simulate        MSC gene trees written as MCMCTree output (validation / power)
+  • ils-genetrees       Gene-tree classes + branch lengths per branch; discordance-vs-rate (GTEE) check
 
 Any subcommand can be run once per subdirectory with the global --per-dir
 flag (see `aeon --help`).
@@ -34,7 +35,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 try:
     from . import bucketing, process, extract_dates, rearrange_triplet, sanitize_tree
-    from . import ils_extract, ils_convergence, ils_analyze, ils_simulate
+    from . import ils_extract, ils_convergence, ils_analyze, ils_simulate, ils_genetrees
 except ModuleNotFoundError as e:
     sys.exit(
         f"aeon is missing a required dependency ({e.name}).\n"
@@ -52,6 +53,7 @@ SUBCOMMAND_MODULES = (
     ils_convergence,
     ils_analyze,
     ils_simulate,
+    ils_genetrees,
 )
 
 
