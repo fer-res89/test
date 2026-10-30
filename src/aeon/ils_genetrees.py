@@ -38,8 +38,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .ils_common import (define_branches, msc_expectations, read_clade_names, read_polytomy,
-                         read_tree_file, reroot_on_leaf)
+from .ils_common import (OutgroupError, define_branches, msc_expectations, parse_outgroup,
+                         read_clade_names, read_polytomy, read_tree_file, reroot_on_outgroup)
 
 
 def _gene_id(path: Path, suffix: str, rx):
@@ -110,7 +110,8 @@ def add_arguments(ap):
     ap.add_argument("--true-tree-dir", help="true gene topologies (ils-simulate trees/), for measuring GTEE")
     ap.add_argument("--true-suffix", default=".tre")
     ap.add_argument("--gene-id-regex", help="regex on the file stem; group 1 (or whole match) is the gene id")
-    ap.add_argument("--outgroup", default="Gallus_gallus")
+    ap.add_argument("--outgroup", default="Gallus_gallus",
+                    help="outgroup taxon or comma-separated outgroup clade")
     ap.add_argument("--polytomy", help="TSV group<TAB>taxa (three rows), as in ils-extract")
     ap.add_argument("--clade-names", help="TSV name<TAB>taxa for readable branch labels")
     ap.add_argument("--bins", type=int, default=3, help="number of rate classes (default terciles)")
@@ -125,9 +126,10 @@ def run(a):
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
     sp = read_tree_file(a.species_tree)
     taxa = sorted(sp.leaf_names())
-    if a.outgroup not in taxa:
-        sys.exit(f"outgroup {a.outgroup} not in species tree")
-    branches, warns = define_branches(sp, a.outgroup, set(taxa) - {a.outgroup}, read_polytomy(a.polytomy),
+    og = parse_outgroup(a.outgroup)
+    if not og <= set(taxa):
+        sys.exit(f"outgroup taxa not in species tree: {sorted(og - set(taxa))}")
+    branches, warns = define_branches(sp, og, set(taxa) - og, read_polytomy(a.polytomy),
                                       read_clade_names(a.clade_names))
     for w in warns:
         print("[WARN]", w)
@@ -148,21 +150,30 @@ def run(a):
             gid = _gene_id(f, a.true_suffix, rx)
             if gid:
                 true_files[gid] = f
+    if not files:
+        sys.exit(f"[ERROR] no files matching *{a.suffix} in {a.gene_tree_dir}")
+    print(f"[INFO] {len(files)} gene-tree files (*{a.suffix}); e.g. {files[0].name}")
+    if a.true_tree_dir:
+        print(f"[INFO] {len(true_files)} true trees with an ID (*{a.true_suffix} in {a.true_tree_dir})")
     rows, skipped = [], []
+    n_true_matched = 0
     for f in files:
         gid = _gene_id(f, a.suffix, rx)
         if gid is None:
-            continue
+            skipped.append((f.name, "gene_id_regex_no_match")); continue
         try:
             t = read_tree_file(f)
         except Exception as e:
             skipped.append((gid, f"parse:{e}")); continue
         tips = t.leaf_names()
-        if a.outgroup not in tips:
+        if not (og & tips):
             skipped.append((gid, "no_outgroup")); continue
         if tips - set(taxa):
-            skipped.append((gid, "unknown_taxa")); continue
-        t = reroot_on_leaf(t, a.outgroup)
+            skipped.append((gid, f"taxa_not_in_species_tree:{','.join(sorted(tips - set(taxa))[:3])}")); continue
+        try:
+            t = reroot_on_outgroup(t, og)
+        except OutgroupError as e:
+            skipped.append((gid, f"outgroup:{e}")); continue
         present = np.zeros(ntax, bool); present[[tax_index[x] for x in tips]] = True
         L = tree_length(t)
         nbr = sum(1 for n in t.preorder() if n.parent is not None)
@@ -170,7 +181,8 @@ def run(a):
         res = classify(t, br_idx, tax_index, ntax, present)
         tres = None
         if gid in true_files:
-            tt = reroot_on_leaf(read_tree_file(true_files[gid]), a.outgroup)
+            n_true_matched += 1
+            tt = reroot_on_outgroup(read_tree_file(true_files[gid]), og)
             tres = classify(tt, br_idx, tax_index, ntax, present)
         for bid, (cls, nin, nout, ok, v, rd) in res.items():
             br = bmap[bid]
@@ -199,12 +211,21 @@ def run(a):
                     dmask = icls != 0
                     row["frac_inferredD_trueC"] = ((tcls[dmask] == 0).mean() if dmask.any() else np.nan)
             rows.append(row)
-    if not rows:
-        sys.exit("[ERROR] no gene trees could be classified")
-    gb = pd.DataFrame(rows)
-    gb.to_csv(out / "gene_branch_lengths.tsv", sep="\t", index=False, float_format="%.6g")
     if skipped:
         pd.DataFrame(skipped, columns=["gene", "reason"]).to_csv(out / "skipped_genes.tsv", sep="\t", index=False)
+        reasons = pd.Series([r.split(":")[0] for _, r in skipped]).value_counts()
+        print("[INFO] skipped:", ", ".join(f"{k} {v}" for k, v in reasons.items()))
+        ex = [(g, r) for g, r in skipped[:3]]
+        print("[INFO] e.g.", "; ".join(f"{g}: {r}" for g, r in ex))
+    if a.true_tree_dir:
+        print(f"[INFO] {n_true_matched} gene trees matched to a true tree")
+        if n_true_matched == 0:
+            print("[WARN] no true trees matched: check that --gene-id-regex extracts the same ID from both "
+                  "file names, and --true-suffix")
+    if not rows:
+        sys.exit("[ERROR] no gene trees could be classified (see the skipped reasons above)")
+    gb = pd.DataFrame(rows)
+    gb.to_csv(out / "gene_branch_lengths.tsv", sep="\t", index=False, float_format="%.6g")
     print(f"[INFO] {gb.gene.nunique()} gene trees classified; {len(skipped)} skipped")
 
     # ---- discordance vs rate, per branch

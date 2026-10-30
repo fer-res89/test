@@ -38,8 +38,8 @@ import numpy as np
 import pandas as pd
 
 from .ils_common import (HPD_RE, Branch, define_branches, msc_expectations, node_ages,
-                            read_clade_names, read_polytomy, read_tree_file,
-                            species_node_for_branch)
+                            outgroup_at_root, parse_outgroup, read_clade_names, read_polytomy,
+                            read_tree_file, species_node_for_branch)
 
 QLEVELS = np.linspace(0, 1, 41)
 QCOLS = [f"q{int(round(lv * 1000)):04d}" for lv in QLEVELS]
@@ -64,8 +64,10 @@ def ess(x: np.ndarray) -> np.ndarray:
     m = 1 << int(np.ceil(np.log2(2 * n)))
     f = np.fft.rfft(xc, n=m, axis=0)
     acov = np.fft.irfft(f * np.conj(f), n=m, axis=0)[:n] / n
+    scale = np.maximum(np.abs(x).mean(0), 1e-300)
     for j in range(k):
-        if var[j] <= 0:
+        # constant chains (e.g. the noise-free truth arm of ils-simulate) have no ESS
+        if var[j] <= (1e-12 * scale[j]) ** 2:
             out[j] = np.nan
             continue
         rho = acov[:, j] / acov[0, j]
@@ -208,10 +210,10 @@ def process_gene(item):
         qc["status"], qc["reason"] = "excluded", f"unknown_taxa:{sorted(unknown)[:3]}"
         return qc, None, None, None
     og = st["outgroup"]
-    if og not in tips:
+    if not (og & set(tips)):
         qc["status"], qc["reason"] = "excluded", "no_outgroup"
         return qc, None, None, None
-    if not any(c.is_leaf() and c.name == og for c in tree.children):
+    if not outgroup_at_root(tree, og):
         qc["status"], qc["reason"] = "excluded", "outgroup_not_at_root"
         return qc, None, None, None
     if smp is None and st["require_samples"]:
@@ -326,11 +328,12 @@ def process_gene(item):
 
 
 def discover(root: Path, fig_suffix: str, mcmc_suffix: str, id_regex: str | None,
-             skip_prior_tag: bool = True):
+             skip_prior_tag: bool = True, on_duplicate: str = "error"):
     """Map gene ID -> (FigTree.tre, mcmc.txt or None). Files named
     <stem>.prior.FigTree.tre (aeon --prior-only without --out-dir) are skipped
     unless fig_suffix itself is the prior suffix."""
     out = {}
+    n_dup = [0]
     if root is None:
         return out
     rx = re.compile(id_regex) if id_regex else None
@@ -348,8 +351,14 @@ def discover(root: Path, fig_suffix: str, mcmc_suffix: str, id_regex: str | None
             gid = m.group(1) if m.groups() else m.group(0)
         mc = fig.with_name(stem + mcmc_suffix)
         if gid in out:
-            raise SystemExit(f"duplicate gene id {gid}: {out[gid][0]} and {fig}")
+            if on_duplicate == "first":
+                n_dup[0] += 1
+                continue
+            raise SystemExit(f"duplicate gene id {gid}: {out[gid][0]} and {fig}\n"
+                             f"(copies of the same run in several folders? use --on-duplicate first)")
         out[gid] = (fig, mc if mc.exists() else None)
+    if n_dup[0]:
+        print(f"[INFO] {root}: {n_dup[0]} duplicate copies ignored (kept the first file per gene)")
     return out
 
 
@@ -358,10 +367,15 @@ def add_arguments(ap):
                     help="ASTRAL species tree (CU internal branch lengths; q1/q2/q3 annotations optional)")
     ap.add_argument("--data-dir", required=True, help="root of the data-run outputs (searched recursively)")
     ap.add_argument("--prior-dir", help="root of the prior-only outputs (searched recursively)")
-    ap.add_argument("--outgroup", default="Gallus_gallus")
+    ap.add_argument("--outgroup", default="Gallus_gallus",
+                    help="outgroup taxon, or comma-separated outgroup clade (e.g. all mammals); the gene-tree "
+                         "root must split the present outgroup taxa from the rest")
     ap.add_argument("--gene-list", help="file with the final locus IDs (Section 4.1); others ignored")
     ap.add_argument("--gene-id-regex", help="regex applied to '<stem>' of <stem>.FigTree.tre; "
                                             "group 1 (or whole match) is the gene ID")
+    ap.add_argument("--on-duplicate", choices=["error", "first"], default="error",
+                    help="several files with the same gene ID (e.g. copies sorted into quartet folders): "
+                         "stop (default) or keep the first")
     ap.add_argument("--fig-suffix", default=".FigTree.tre")
     ap.add_argument("--mcmc-suffix", default=".mcmc.txt")
     ap.add_argument("--polytomy", help="TSV: group<TAB>comma-separated taxa, three rows (Section 13)")
@@ -389,10 +403,11 @@ def run(a):
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
     sp = read_tree_file(a.species_tree)
     taxa = sorted(sp.leaf_names())
-    if a.outgroup not in taxa:
-        sys.exit(f"outgroup {a.outgroup} not in species tree")
-    ingroup = set(taxa) - {a.outgroup}
-    branches, warns = define_branches(sp, a.outgroup, ingroup, read_polytomy(a.polytomy),
+    og = parse_outgroup(a.outgroup)
+    if not og <= set(taxa):
+        sys.exit(f"outgroup taxa not in species tree: {sorted(og - set(taxa))}")
+    ingroup = set(taxa) - og
+    branches, warns = define_branches(sp, og, ingroup, read_polytomy(a.polytomy),
                                       read_clade_names(a.clade_names), a.polytomy_T)
     for w in warns:
         print("[WARN]", w)
@@ -419,15 +434,18 @@ def run(a):
     bdf = pd.DataFrame(rows)
     bdf.to_csv(out / "branches.tsv", sep="\t", index=False)
     print(f"[INFO] {len(branches)} testable branches; {bdf.n_triplets.sum()} branch-specific triplets "
-          f"(of {len(ingroup) * (len(ingroup) - 1) * (len(ingroup) - 2) // 6} lepidosaur triplets)")
+          f"(of {len(ingroup) * (len(ingroup) - 1) * (len(ingroup) - 2) // 6} ingroup triplets)")
 
-    dmap = discover(Path(a.data_dir), a.fig_suffix, a.mcmc_suffix, a.gene_id_regex)
+    dmap = discover(Path(a.data_dir), a.fig_suffix, a.mcmc_suffix, a.gene_id_regex,
+                    on_duplicate=a.on_duplicate)
     pmap = {}
     if a.prior_dir:
         # aeon --prior-only writes <stem>.prior.* unless given --out-dir
-        pmap = discover(Path(a.prior_dir), ".prior" + a.fig_suffix, ".prior" + a.mcmc_suffix, a.gene_id_regex)
+        pmap = discover(Path(a.prior_dir), ".prior" + a.fig_suffix, ".prior" + a.mcmc_suffix, a.gene_id_regex,
+                        on_duplicate=a.on_duplicate)
         if not pmap:
-            pmap = discover(Path(a.prior_dir), a.fig_suffix, a.mcmc_suffix, a.gene_id_regex)
+            pmap = discover(Path(a.prior_dir), a.fig_suffix, a.mcmc_suffix, a.gene_id_regex,
+                            on_duplicate=a.on_duplicate)
     genes = sorted(dmap)
     if a.gene_list:
         keep = {ln.strip() for ln in Path(a.gene_list).read_text().splitlines() if ln.strip()}
@@ -441,7 +459,7 @@ def run(a):
     items = [(g, dmap[g][0], dmap[g][1], pmap.get(g, (None, None))[0], pmap.get(g, (None, None))[1])
              for g in genes]
     state = dict(branches=branches, trip_idx=trip_idx, tax_index=tax_index, taxa=taxa,
-                 outgroup=a.outgroup, discard=a.discard_frac, tol=a.mean_check_tol,
+                 outgroup=og, discard=a.discard_frac, tol=a.mean_check_tol,
                  require_prior=not a.allow_no_prior, require_samples=not a.allow_no_samples,
                  trip_branches=set(x for x in a.triplet_branches.split(",") if x),
                  write_clades=not a.no_clades)

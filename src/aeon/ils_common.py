@@ -236,15 +236,11 @@ def to_newick(root: Node, lengths=True, internal_labels=False) -> str:
 # Tree manipulation
 # --------------------------------------------------------------------------
 
-def reroot_on_leaf(root: Node, outgroup: str) -> Node:
+def _reroot_on_node(root: Node, og: Node) -> Node:
     """Return a new rooted tree with `outgroup` as one child of the root.
     Edge lengths and internal labels/comments stay attached to the node below
     each edge, as far as that is well defined (labels on edges whose direction
     flips are moved with the edge)."""
-    leaves = {lf.name: lf for lf in root.leaves()}
-    if outgroup not in leaves:
-        raise ValueError(f"outgroup {outgroup} not in tree")
-    og = leaves[outgroup]
     if og.parent is root and len(root.children) == 2:
         return root
     # Build undirected adjacency with edge data keyed by the child node
@@ -280,8 +276,9 @@ def reroot_on_leaf(root: Node, outgroup: str) -> Node:
         return cp
 
     a = build(og, other, og, edge_len)
-    a.children = []
-    a.name = og.name
+    if og.is_leaf():
+        a.children = []
+        a.name = og.name
     b = build(other, og, og, 0.0)
     for x in (a, b):
         x.parent = new_root
@@ -289,6 +286,55 @@ def reroot_on_leaf(root: Node, outgroup: str) -> Node:
     a.label = a.comment = ""
     renumber(new_root)
     return new_root
+
+
+def reroot_on_leaf(root: Node, outgroup: str) -> Node:
+    """Root on the edge above one leaf."""
+    leaves = {lf.name: lf for lf in root.leaves()}
+    if outgroup not in leaves:
+        raise ValueError(f"outgroup {outgroup} not in tree")
+    return _reroot_on_node(root, leaves[outgroup])
+
+
+def parse_outgroup(spec) -> frozenset:
+    """'Gallus_gallus' or 'Mus_musculus,Homo_sapiens,...' -> set of taxa."""
+    if isinstance(spec, (set, frozenset, list, tuple)):
+        return frozenset(spec)
+    return frozenset(t.strip() for t in str(spec).split(",") if t.strip())
+
+
+class OutgroupError(ValueError):
+    pass
+
+
+def reroot_on_outgroup(root: Node, outgroup) -> Node:
+    """Root on the edge separating the outgroup taxa (those present in the
+    tree) from everything else. The outgroup may be one leaf or a clade; if
+    the present outgroup taxa are not a clade on either side of some edge,
+    OutgroupError is raised."""
+    og = parse_outgroup(outgroup) & root.leaf_names()
+    if not og:
+        raise OutgroupError("no outgroup taxon in tree")
+    if len(og) == 1:
+        return reroot_on_leaf(root, next(iter(og)))
+    allt = root.leaf_names()
+    if len(root.children) == 2 and any(c.leaf_names() == og for c in root.children):
+        return root
+    rest = allt - og
+    for nd in root.preorder():
+        if nd is root:
+            continue
+        ls = nd.leaf_names()
+        if ls == og:
+            return _reroot_on_node(root, nd)
+        if ls == rest:                     # outgroup is on the root side of this edge
+            return _reroot_on_node(root, nd)
+    raise OutgroupError("outgroup taxa are not monophyletic")
+
+
+def outgroup_at_root(root: Node, outgroup) -> bool:
+    og = parse_outgroup(outgroup) & root.leaf_names()
+    return bool(og) and len(root.children) == 2 and any(c.leaf_names() == og for c in root.children)
 
 
 def renumber(root: Node):
@@ -448,7 +494,7 @@ def define_branches(species_tree: Node, outgroup: str, ingroup: set[str],
     clade_names = clade_names or {}
     warnings = []
     orig = species_tree
-    rt = reroot_on_leaf(orig, outgroup)
+    rt = reroot_on_outgroup(orig, outgroup)
     allt = rt.leaf_names()
     poly_sets = None
     if polytomy:
